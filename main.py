@@ -3,8 +3,8 @@ import telebot
 from flask import Flask
 import threading
 
-BOT_TOKEN = "APNA_TOKEN_YAHAN_DALO" # Yahan BotFather wala token dalo
-CHAT_ID = "" # Khali chhor do
+BOT_TOKEN = "8747062832:AAHSM-scnf25COvXaADnFgOLWJ7ZV9l-tjE"
+CHAT_ID = ""
 
 app = Flask(__name__)
 exchange = ccxt.bybit({'enableRateLimit': True})
@@ -39,16 +39,16 @@ def get_signal():
 
 @bot.message_handler(commands=['start'])
 def start(m):
-    bot.reply_to(m, "Bot Live! /signal bhejo")
+    bot.reply_to(m, "Adil Bhai Bot Live! /signal bhejo")
 
 @bot.message_handler(commands=['signal'])
 def sig(m):
-    bot.reply_to(m, "Signal nikal raha hu...")
+    bot.reply_to(m, "Signal nikal raha hu Adil Bhai...")
     bot.reply_to(m, get_signal())
 
 @app.route('/')
 def home():
-    return "Behtareen Bot Running"
+    return "Adil Bhai Behtareen Bot Live 24/7"
 
 def run():
     bot.infinity_polling()
