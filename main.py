@@ -10,17 +10,17 @@ CHAT_ID = os.environ.get("CHAT_ID")
 app = Flask('')
 @app.route('/')
 def home(): return "TRIPLE TF BOT IS LIVE 24/7"
-def run(): app.run(host='0.0.0.0', port=8080)
+def run(): app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
 def keep_alive(): Thread(target=run).start()
 
 async def get_analysis():
     exchange = ccxt.binance()
     ticker = exchange.fetch_ticker('BTC/USDT')
     price = ticker['last']
-    return f"BTC Price: ${price} | 15M 1H 4H STRONG BUY | TP: {price*1.02:.2f} SL: {price*0.99:.2f}"
+    return f"BTC: ${price} | 15M 1H 4H STRONG BUY | SL: {price*0.99:.2f} TP: {price*1.02:.2f}"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Bot Live Hai! /signal likho signal ke liye")
+    await update.message.reply_text("✅ Bot Live Hai! /signal likho")
 
 async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Signal nikal raha hu...")
@@ -35,6 +35,7 @@ async def main():
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
+    print("Bot Polling Started!")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
