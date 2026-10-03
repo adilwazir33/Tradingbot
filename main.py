@@ -73,3 +73,15 @@ while True:
     except Exception as e:
         print(e)
         time.sleep(60)
+# --- INSTANT SIGNAL COMMAND ---
+async def signal_command(update, context):
+    await update.message.reply_text("🔍 Market check kar raha hun... 2 sec")
+    
+    # Yahan bot BTC ka instant analysis karega
+    # Aapke wale triple TF function ko call karega
+    result = await check_market_now()  # ye aapka analysis wala function hai
+    
+    await update.message.reply_text(f"📊 INSTANT UPDATE:\n\n{result}")
+
+# Neeche jahan application.add_handler hai wahan ye bhi add karo:
+application.add_handler(CommandHandler("signal", signal_command))
