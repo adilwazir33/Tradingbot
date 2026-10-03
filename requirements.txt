@@ -1,6 +1,3 @@
 pyTelegramBotAPI
 ccxt
 flask
-pandas
-ta
-python-telegram-bot
