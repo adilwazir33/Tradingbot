@@ -1,4 +1,3 @@
 pyTelegramBotAPI
 yfinance
-Pillow
 Flask
