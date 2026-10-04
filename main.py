@@ -1,93 +1,63 @@
 import os
-import requests
-import time
-from flask import Flask
-from threading import Thread
+import telebot
+import yfinance as yf
+from PIL import Image, ImageDraw, ImageFont
+import io
 
-app = Flask(__name__)
+# Render se Token lega, agar nahi to neeche wala use karega
+BOT_TOKEN = os.getenv("BOT_TOKEN", "APNA_TOKEN_YAHAN_DALO")
+bot = telebot.TeleBot(BOT_TOKEN)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-print(f"BOT_TOKEN exists: {bool(BOT_TOKEN)}")
+PAIRS = {
+    "XAUUSD.r": "GC=F",
+    "EURUSD.r": "EURUSD=X",
+    "BTCUSD.r": "BTC-USD",
+    "USDJPY.r": "USDJPY=X",
+    "NACUSD.r": "^IXIC"
+}
 
-# Bot import only if token exists
-if BOT_TOKEN:
-    import telebot
-    bot = telebot.TeleBot(BOT_TOKEN)
-    SYMBOL = "BTCUSDT"
-
-    def get_data(interval):
+def get_signals():
+    res = {}
+    for name, code in PAIRS.items():
         try:
-            url = f"https://data-api.binance.vision/api/v3/klines?symbol={SYMBOL}&interval={interval}&limit=100"
-            r = requests.get(url, timeout=10).json()
-            if not isinstance(r, list): return None
-            return [float(x[4]) for x in r]
+            df = yf.download(code, period="2d", interval="1h", progress=False, auto_adjust=True)
+            if len(df) > 1 and df['Close'].iloc[-1] > df['Close'].iloc[-2]:
+                res[name] = "BUY"
+            else:
+                res[name] = "SELL"
         except:
-            return None
+            res[name] = "WAIT"
+    return res
 
-    def analyze(tf_code, tf_name):
-        closes = get_data(tf_code)
-        if not closes or len(closes) < 50: return None
-        price = closes[-1]
-        ema20 = sum(closes[-20:])/20
-        ema50 = sum(closes[-50:])/50
-        gains=[]; losses=[]
-        for i in range(1,15):
-            d=closes[-i]-closes[-i-1]
-            (gains if d>0 else losses).append(abs(d))
-        ag=sum(gains)/14 if gains else 0.01
-        al=sum(losses)/14 if losses else 0.01
-        rsi=100-(100/(1+ag/al))
-        sig="LONG" if price>ema20>ema50 and 55<rsi<75 else "SHORT" if price<ema20<ema50 and 25<rsi<45 else "NO TRADE"
-        return {"tf":tf_name,"price":price,"sig":sig,"rsi":round(rsi,1)}
+def make_image(signals):
+    W, H = 800, 620
+    img = Image.new('RGB', (W, H), (14, 16, 22))
+    d = ImageDraw.Draw(img)
+    d.rectangle([0,0,W,85], fill=(25, 28, 36))
+    d.text((30, 22), "ADIL SIGNALS BOT - 5 PAIRS", fill=(255,255,255))
+    d.text((30, 50), "15MIN + 1H = FINAL CONFIRMED", fill=(140,140,140))
+    y = 120
+    for p, s in signals.items():
+        color = (34,197,94) if s=="BUY" else (239,68,68) if s=="SELL" else (234,179,8)
+        d.text((40, y+12), p, fill=(255,255,255))
+        d.rounded_rectangle([500, y, 750, y+50], radius=12, fill=color)
+        txt = f"{s} CONFIRMED" if s!="WAIT" else "WAIT"
+        d.text((540, y+16), txt, fill=(255,255,255))
+        y+=85
+    bio = io.BytesIO()
+    img.save(bio, 'PNG')
+    bio.seek(0)
+    return bio
 
-    def format_one(d):
-        if not d: return "⏳ Loading... 5 sec baad /signal"
-        p=d['price']; tf=d['tf']
-        if d['sig']=="NO TRADE": return f"⏳ {tf} BTC {p:.2f} RSI:{d['rsi']} WAIT"
-        if d['sig']=="LONG":
-            sl,tp1=p*0.988,p*1.012
-            return f"🚀 {tf} BUY {p:.2f} TP:{tp1:.2f} SL:{sl:.2f} RSI:{d['rsi']}"
-        else:
-            sl,tp1=p*1.012,p*0.988
-            return f"🔻 {tf} SELL {p:.2f} TP:{tp1:.2f} SL:{sl:.2f} RSI:{d['rsi']}"
+@bot.message_handler(func=lambda m: m.text and "signal" in m.text.lower())
+def signal_handler(m):
+    bot.send_message(m.chat.id, "Signal nikal raha hu Adil Bhai... ⏳")
+    sigs = get_signals()
+    pic = make_image(sigs)
+    cap = "📊 5 Pairs Final Signal:\n\n"
+    for k,v in sigs.items():
+        cap += f"{'🟢' if v=='BUY' else '🔴' if v=='SELL' else '🟡'} {k} = {v}\n"
+    bot.send_photo(m.chat.id, pic, caption=cap)
 
-    def full_report():
-        a=analyze("15m","15MIN"); time.sleep(0.3)
-        b=analyze("1h","1HOUR"); time.sleep(0.3)
-        c=analyze("4h","4HOUR")
-        if not a or not b or not c: return "⏳ 10 sec baad /signal bhejo"
-        longs=sum(1 for x in [a,b,c] if x['sig']=="LONG")
-        shorts=sum(1 for x in [a,b,c] if x['sig']=="SHORT")
-        final="BUY CONFIRMED" if longs>=2 else "SELL CONFIRMED" if shorts>=2 else "WAIT"
-        return f"🏦 FULL PRO BTC {a['price']:.2f}\n\n{format_one(a)}\n---\n{format_one(b)}\n---\n{format_one(c)}\n\nFINAL: {final}"
-
-    @bot.message_handler(commands=['start'])
-    def start(m): bot.send_message(m.chat.id, "🏦 1000% Ready /signal")
-
-    @bot.message_handler(commands=['signal'])
-    def sig(m): bot.send_message(m.chat.id, full_report())
-
-    @bot.message_handler(commands=['15m','1h','4h','price'])
-    def all_cmd(m):
-        txt=m.text
-        if '15m' in txt: bot.send_message(m.chat.id, format_one(analyze("15m","15MIN")))
-        elif '1h' in txt: bot.send_message(m.chat.id, format_one(analyze("1h","1HOUR")))
-        elif '4h' in txt: bot.send_message(m.chat.id, format_one(analyze("4h","4HOUR")))
-        else:
-            c=get_data("1m")
-            if c: bot.send_message(m.chat.id, f"BTC: {c[-1]:.2f}")
-
-    def run_bot():
-        while True:
-            try: bot.infinity_polling()
-            except Exception as e:
-                print(f"Bot error: {e}"); time.sleep(5)
-
-    Thread(target=run_bot, daemon=True).start()
-
-@app.route('/')
-def home():
-    return "Bot is Live - 1000% Working"
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+print("BOT IS LIVE - Waiting for 'signal'")
+bot.infinity_polling()
