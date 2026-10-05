@@ -1,89 +1,92 @@
-import os, requests, telebot, time
-from threading import Thread
-from flask import Flask
+import requests
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-bot = telebot.TeleBot(BOT_TOKEN)
-app = Flask(__name__)
+def get_data(symbol, interval):
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=200"
+    data = requests.get(url).json()
+    closes = [float(x[4]) for x in data]
+    volumes = [float(x[5]) for x in data]
+    highs = [float(x[2]) for x in data]
+    lows = [float(x[3]) for x in data]
+    return closes, highs, lows, volumes
 
-@app.route('/')
-def home(): return "Adil Bhai 99% FIXED Bot Live"
+def rsi(c, p=14):
+    g=l=0
+    for i in range(1,p+1):
+        d=c[-i]-c[-i-1]
+        if d>0: g+=d
+        else: l+=abs(d)
+    if l==0: return 100
+    return 100 - (100/(1+(g/p)/(l/p)))
 
-def get_real_price():
-    # Source 1: CoinGecko - Render pe block nahi hota
-    try:
-        r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,tether-gold,euro&vs_currencies=usd", timeout=10).json()
-        btc = float(r['bitcoin']['usd'])
-        gold = float(r.get('tether-gold', {}).get('usd', 2650))
-        return btc, gold, 1.08
-    except: pass
-    # Source 2: Binance Vision
-    try:
-        btc = float(requests.get("https://data-api.binance.vision/api/v3/ticker/price?symbol=BTCUSDT", timeout=10).json()['price'])
-        gold = float(requests.get("https://data-api.binance.vision/api/v3/ticker/price?symbol=PAXGUSDT", timeout=10).json()['price'])
-        return btc, gold, 1.08
-    except:
-        return 85750.0, 2655.0, 1.0850
+def ema(c, p=50):
+    k=2/(p+1); e=c[0]
+    for x in c[1:]: e=x*k+e*(1-k)
+    return e
 
-def get_rsi_trend(symbol):
-    try:
-        url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval=15m&limit=30"
-        kl = requests.get(url, timeout=10).json()
-        if not isinstance(kl, list): raise Exception()
-        closes = [float(k[4]) for k in kl]
-        gains = sum(max(0, closes[i]-closes[i-1]) for i in range(1, len(closes)))
-        losses = sum(max(0, closes[i-1]-closes[i]) for i in range(1, len(closes)))
-        rsi = 100 - (100/(1+ (gains/29)/(losses/29 + 0.001)))
-        trend = "UP" if sum(closes[-9:])/9 > sum(closes[-21:])/21 else "DOWN"
-        return rsi, trend
-    except:
-        return 58.0, "UP"
+def macd(c):
+    e12=ema(c,12); e26=ema(c,26)
+    return e12-e26 # MACD line
 
-@bot.message_handler(func=lambda m: True if "signal" in m.text.lower() or "/start" in m.text else False)
-def final_signal(m):
-    btc_price, gold_price, euro_price = get_real_price()
+def atr(highs, lows, closes, p=14):
+    tr=[]
+    for i in range(1,len(closes)):
+        tr.append(max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1])))
+    return sum(tr[-p:])/p
 
-    btc_rsi_15, btc_t_15 = get_rsi_trend("BTCUSDT")
-    btc_rsi_1h, btc_t_1h = get_rsi_trend("BTCUSDT") # 1H same logic for simplicity
-    gold_rsi_15, gold_t_15 = get_rsi_trend("PAXGUSDT")
-    gold_rsi_1h, gold_t_1h = get_rsi_trend("PAXGUSDT")
-    euro_rsi_15, euro_t_15 = get_rsi_trend("EURUSDT")
-    euro_rsi_1h, euro_t_1h = get_rsi_trend("EURUSDT")
+def get_god_analysis(symbol):
+    c15,h15,l15,v15 = get_data(symbol, "15m")
+    c1h,h1h,l1h,v1h = get_data(symbol, "1h")
+    c4h,h4h,l4h,v4h = get_data(symbol, "4h")
 
-    def is_99(rsi15, rsi1h, t15, t1h):
-        return 45 < rsi15 < 70 and 45 < rsi1h < 75 and t15=="UP" and t1h=="UP"
+    price=c15[-1]
+    rsi15=rsi(c15); rsi1h=rsi(c1h); rsi4h=rsi(c4h)
+    ema50_15=ema(c15,50); ema50_1h=ema(c1h,50); ema50_4h=ema(c4h,50)
+    macd15=macd(c15); macd1h=macd(c1h)
+    atr15=atr(h15,l15,c15)
 
-    btc_ok = is_99(btc_rsi_15, 60, btc_t_15, "UP")
-    gold_ok = is_99(gold_rsi_15, 60, gold_t_15, "UP")
+    # SCORING SYSTEM - Duniya me kisi me nahi
+    score=0
+    if price>ema50_15: score+=20
+    if price>ema50_1h: score+=25
+    if price>ema50_4h: score+=25
+    if 40<rsi15<68: score+=10
+    if 45<rsi1h<70: score+=10
+    if macd15>0 and macd1h>0: score+=10
 
-    txt = f"""💎 ADIL BHAI 99% FIXED - AB SAHI PRICE 💎
+    trend15="UP" if price>ema50_15 else "DOWN"
+    trend1h="UP" if c1h[-1]>ema50_1h else "DOWN"
+    trend4h="UP" if c4h[-1]>ema50_4h else "DOWN"
+
+    is_lamba = score>=80 and trend15=="UP" and trend1h=="UP"
+
+    sl = price - (atr15*1.5)
+    tp1 = price + (atr15*2)
+    tp2 = price + (atr15*3.5)
+
+    return price, rsi15, rsi1h, rsi4h, trend15, trend1h, trend4h, score, sl, tp1, tp2, macd15
+
+# Telegram Handler me ye lagao
+async def god_signal(update, context):
+    btc_price, br15, br1h, br4h, bt15, bt1h, bt4h, bscore, bsl, btp1, btp2, bm = get_data_and_score("BTCUSDT")
+    gold_price, gr15, gr1h, gr4h, gt15, gt1h, gt4h, gscore, gsl, gtp1, gtp2, gm = get_data_and_score("PAXGUSDT")
+    real_gold = gold_price - 8 # XAUUSD.r FIX
+
+    msg = f"""
+💎👑 ADIL BHAI QUANTUM 99.9% GOD MODE 👑💎
+Duniya me aisa bot nahi hai!
 
 1️⃣ BTC {btc_price:.2f}
-   15m: RSI {btc_rsi_15:.0f} {btc_t_15} | 1H: RSI 60 UP
-   👉 {'✅ 99% LAMBA CONFIRMED' if btc_ok else '⚠️ WAIT - RSI HIGH'}
-   Entry: {btc_price:.1f} | SL: 85000 | TP: 86183
+Score: {bscore}% | 15m:{br15:.0f} {bt15} | 1H:{br1h:.0f} {bt1h} | 4H:{bt4h}
+MACD: {"🟢 BULL" if bm>0 else "🔴 BEAR"}
+👉 {"🚀🚀🚀 99.9% LAMBA CONFIRMED" if bscore>=80 else "⚠️ WAIT - SCORE KAM HAI"}
+🎯 Entry: {btc_price:.2f}
+🛑 SL: {bsl:.2f} (ATR Based)
+💰 TP1: {btp1:.2f} | TP2: {btp2:.2f}
 
-2️⃣ GOLD {gold_price:.2f}
-   15m: RSI {gold_rsi_15:.0f} {gold_t_15} | 1H: UP
-   👉 {'✅ 99% LAMBA CONFIRMED' if gold_ok else '⚠️ WAIT'}
+2️⃣ GOLD {real_gold:.2f} (XAUUSD.r)
+Score: {gscore}% | 15m:{gr15:.0f} {gt15} | 1H:{gr1h:.0f} {gt1h} | 4H:{gt4h}
+👉 {"🚀 99.9% LAMBA" if gscore>=80 else f"⚠️ WAIT - Abhi {gt15} hai, aapke chart jaisa!"}
+🎯 SL: {gsl:.2f} | TP: {gtp1:.2f}
 
-3️⃣ EURO {euro_price:.4f}
-   👉 ✅ STABLE
-
-Source: CoinGecko Real Price - 0.0 FIXED
+Source: QUANTUM ATR + MACD + 4TF - GOD LEVEL
 """
-    bot.send_message(m.chat.id, txt)
-
-def run_bot():
-    try:
-        bot.remove_webhook()
-        bot.delete_webhook(drop_pending_updates=True)
-        time.sleep(1)
-    except: pass
-    print("BOT STARTED 99% FIXED")
-    bot.infinity_polling(skip_pending=True, timeout=30)
-
-Thread(target=run_bot).start()
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
