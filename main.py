@@ -11,7 +11,12 @@ import pandas as pd
 from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from quotexapi.stable_api import Quotex
+
+# FIXED FOR RENDER - pyquotex support
+try:
+    from quotexapi.stable_api import Quotex
+except ModuleNotFoundError:
+    from pyquotex.stable_api import Quotex
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -24,7 +29,7 @@ OTC_MAP = {"EURUSD": "EURUSD_otc", "GBPUSD": "GBPUSD_otc", "EURJPY": "EURJPY_otc
 app = Flask(__name__)
 @app.route("/")
 def home():
-    return "QUOTEX v10.4 FINAL"
+    return "QUOTEX v10.4 FINAL - FIXED"
 @app.route("/health")
 def health():
     return "OK"
@@ -207,7 +212,6 @@ def analyze_pair(qx, asset, entry_ts):
         return {"signal": sig, "close": last["close"], "time": last["time"], "rsi": last["rsi"], "conf": conf}
     return None
 
-# ===== YOUR DEFENSIVE FIX - FINAL =====
 def fetch_candles_with_retry(qx, asset, target_ts=None, retries=5):
     for attempt in range(retries):
         try:
