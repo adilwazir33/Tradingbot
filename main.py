@@ -21,12 +21,19 @@ INTERVALS = {
     "H1": "1h",
     "H4": "4h",
 }
-MIN_SCORE = 8
+# Current scoring system has a maximum of 7.
+# 6 = strong enough while still allowing Forex/Gold
+# where volume may not be available.
+MIN_SCORE = 6
 COOLDOWN_MINUTES = 45
 SL_ATR = 1.20
 TP1_ATR = 1.50
 TP2_ATR = 2.50
+# 3 symbols x 3 timeframes = 9 API calls.
+# 5-minute cycle keeps Twelve Data request rate safely lower.
+SCAN_SECONDS = 300
 API_URL = "https://api.twelvedata.com/time_series"
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 app = Flask(__name__)
 last_signal = {}
 # ============================================================
@@ -41,26 +48,174 @@ def flask_server():
 # ============================================================
 # TELEGRAM
 # ============================================================
-def send_telegram(message):
-    if not BOT_TOKEN or not CHAT_ID:
-        print("ERROR: BOT_TOKEN or CHAT_ID missing")
-        return False
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+def telegram_request(method, payload=None, timeout=30):
+    if not BOT_TOKEN:
+        print("ERROR: BOT_TOKEN missing")
+        return None
+    url = f"{TELEGRAM_API}/{method}"
     try:
         response = requests.post(
             url,
-            json={
-                "chat_id": CHAT_ID,
-                "text": message,
-                "parse_mode": "HTML",
-            },
-            timeout=20,
+            json=payload or {},
+            timeout=timeout,
         )
-        print("Telegram:", response.status_code)
-        return response.ok
+        data = response.json()
+        if not response.ok or not data.get("ok"):
+            print(
+                f"Telegram {method} error:",
+                data.get("description", response.text)
+            )
+            return None
+        return data
     except Exception as e:
-        print("Telegram error:", e)
+        print(f"Telegram {method} exception:", e)
+        return None
+def send_telegram(message, chat_id=None):
+    target_chat = chat_id or CHAT_ID
+    if not BOT_TOKEN:
+        print("ERROR: BOT_TOKEN missing")
         return False
+    if not target_chat:
+        print("ERROR: CHAT_ID missing")
+        return False
+    result = telegram_request(
+        "sendMessage",
+        {
+            "chat_id": target_chat,
+            "text": message,
+            "parse_mode": "HTML",
+        },
+        timeout=20,
+    )
+    if result:
+        print("Telegram message sent: OK")
+        return True
+    print("Telegram message sent: FAILED")
+    return False
+def telegram_check():
+    if not BOT_TOKEN:
+        print("TELEGRAM STATUS: BOT_TOKEN missing")
+        return False
+    result = telegram_request("getMe", {}, timeout=15)
+    if not result:
+        print("TELEGRAM STATUS: FAILED")
+        return False
+    bot = result["result"]
+    print(
+        "TELEGRAM STATUS: OK | "
+        f"@{bot.get('username', 'unknown')}"
+    )
+    return True
+def telegram_startup_message():
+    message = """
+<b>🟢 ADIL SIGNAL BOT ONLINE</b>
+✅ Telegram Connected
+✅ Twelve Data Configured
+📊 Scanner Active
+<b>Symbols:</b>
+XAUUSD.r
+EURUSD.r
+BTCUSD.r
+<b>Timeframes:</b>
+M15 + H1 + H4
+<b>Broker:</b> Lirunex MT5
+<b>Execution:</b> Manual
+⚠️ Twelve Data public-feed price may differ from Lirunex MT5.
+"""
+    return send_telegram(message)
+def telegram_listener():
+    """
+    Handles /start, /status and /test.
+    Uses Telegram Bot API directly, so no extra package is needed.
+    """
+    if not BOT_TOKEN:
+        print("Telegram listener stopped: BOT_TOKEN missing")
+        return
+    # Remove any old webhook so long polling can work.
+    telegram_request(
+        "deleteWebhook",
+        {"drop_pending_updates": False},
+        timeout=15,
+    )
+    offset = None
+    print("Telegram command listener started")
+    while True:
+        try:
+            payload = {
+                "timeout": 25,
+                "allowed_updates": ["message"],
+            }
+            if offset is not None:
+                payload["offset"] = offset
+            result = telegram_request(
+                "getUpdates",
+                payload,
+                timeout=35,
+            )
+            if not result:
+                time.sleep(5)
+                continue
+            updates = result.get("result", [])
+            for update in updates:
+                offset = update["update_id"] + 1
+                message = update.get("message")
+                if not message:
+                    continue
+                text = message.get("text", "").strip()
+                chat = message.get("chat", {})
+                chat_id = str(chat.get("id", ""))
+                # Only respond to the configured chat.
+                if CHAT_ID and chat_id != str(CHAT_ID):
+                    print(
+                        f"Ignored Telegram command from chat {chat_id}"
+                    )
+                    continue
+                if text.startswith("/start"):
+                    send_telegram(
+                        """
+<b>🟢 ADIL SIGNAL BOT</b>
+Bot is online and scanning.
+✅ Telegram
+✅ Twelve Data
+✅ M15
+✅ H1
+✅ H4
+Commands:
+/start - bot status
+/status - system status
+/test - Telegram test
+""",
+                        chat_id,
+                    )
+                elif text.startswith("/status"):
+                    send_telegram(
+                        """
+<b>📊 ADIL BOT STATUS</b>
+🟢 Render: Running
+🟢 Telegram: Connected
+🟢 Twelve Data: Configured
+🟢 Scanner: Active
+<b>Symbols:</b>
+XAUUSD.r
+EURUSD.r
+BTCUSD.r
+<b>Scan interval:</b>
+5 minutes
+""",
+                        chat_id,
+                    )
+                elif text.startswith("/test"):
+                    send_telegram(
+                        """
+<b>🧪 TELEGRAM TEST</b>
+Telegram connection is working correctly.
+🟢 Bot is ready.
+""",
+                        chat_id,
+                    )
+        except Exception as e:
+            print("Telegram listener error:", e)
+            time.sleep(5)
 # ============================================================
 # TWELVE DATA
 # ============================================================
@@ -82,10 +237,10 @@ def get_market_data(symbol, interval):
             timeout=20,
         )
         data = response.json()
-        if "status" in data and data["status"] == "error":
+        if data.get("status") == "error":
             print(
                 f"DATA ERROR {symbol} {interval}:",
-                data.get("message")
+                data.get("message"),
             )
             return None
         values = data.get("values")
@@ -102,7 +257,9 @@ def get_market_data(symbol, interval):
         ]
         for column in required:
             if column not in df.columns:
-                print(f"Missing {column}: {symbol}")
+                print(
+                    f"Missing {column}: {symbol} {interval}"
+                )
                 return None
         df["time"] = pd.to_datetime(df["datetime"])
         for column in [
@@ -113,15 +270,14 @@ def get_market_data(symbol, interval):
         ]:
             df[column] = pd.to_numeric(
                 df[column],
-                errors="coerce"
+                errors="coerce",
             )
         if "volume" in df.columns:
             df["volume"] = pd.to_numeric(
                 df["volume"],
-                errors="coerce"
+                errors="coerce",
             )
         else:
-            # Forex/gold feeds may not provide volume.
             df["volume"] = 0.0
         df = df.dropna(
             subset=[
@@ -131,13 +287,16 @@ def get_market_data(symbol, interval):
                 "close",
             ]
         )
-        # Twelve Data commonly returns newest first.
         df = df.sort_values("time").reset_index(drop=True)
+        print(
+            f"DATA OK | {symbol} | {interval} | "
+            f"{len(df)} candles"
+        )
         return df
     except Exception as e:
         print(
             f"Market data error {symbol} {interval}:",
-            e
+            e,
         )
         return None
 # ============================================================
@@ -146,7 +305,7 @@ def get_market_data(symbol, interval):
 def ema(series, period):
     return series.ewm(
         span=period,
-        adjust=False
+        adjust=False,
     ).mean()
 def rsi(series, period=14):
     delta = series.diff()
@@ -155,12 +314,12 @@ def rsi(series, period=14):
     avg_gain = gain.ewm(
         alpha=1 / period,
         min_periods=period,
-        adjust=False
+        adjust=False,
     ).mean()
     avg_loss = loss.ewm(
         alpha=1 / period,
         min_periods=period,
-        adjust=False
+        adjust=False,
     ).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (
@@ -178,14 +337,14 @@ def atr(df, period=14):
         [
             high_low,
             high_close,
-            low_close
+            low_close,
         ],
-        axis=1
+        axis=1,
     ).max(axis=1)
     return true_range.ewm(
         alpha=1 / period,
         min_periods=period,
-        adjust=False
+        adjust=False,
     ).mean()
 # ============================================================
 # TIMEFRAME ANALYSIS
@@ -194,11 +353,26 @@ def analyze(df):
     if df is None or len(df) < 220:
         return None
     df = df.copy()
-    df["ema21"] = ema(df["close"], 21)
-    df["ema50"] = ema(df["close"], 50)
-    df["ema200"] = ema(df["close"], 200)
-    df["rsi"] = rsi(df["close"], 14)
-    df["atr"] = atr(df, 14)
+    df["ema21"] = ema(
+        df["close"],
+        21,
+    )
+    df["ema50"] = ema(
+        df["close"],
+        50,
+    )
+    df["ema200"] = ema(
+        df["close"],
+        200,
+    )
+    df["rsi"] = rsi(
+        df["close"],
+        14,
+    )
+    df["atr"] = atr(
+        df,
+        14,
+    )
     df["volume_avg"] = (
         df["volume"]
         .rolling(20)
@@ -229,14 +403,18 @@ def analyze(df):
         buy += 1
     elif row["close"] < previous["close"]:
         sell += 1
-    # Volume only when actual volume exists
-    if row["volume"] > 0 and row["volume_avg"] > 0:
-        if row["volume"] > row["volume_avg"]:
-            if row["close"] > previous["close"]:
-                buy += 1
-            elif row["close"] < previous["close"]:
-                sell += 1
-    # Require strong directional setup
+    # Volume when available
+    if (
+        row["volume"] > 0
+        and row["volume_avg"] > 0
+        and row["volume"] > row["volume_avg"]
+    ):
+        if row["close"] > previous["close"]:
+            buy += 1
+        elif row["close"] < previous["close"]:
+            sell += 1
+    if not np.isfinite(row["atr"]):
+        return None
     if buy >= MIN_SCORE and buy > sell:
         return {
             "side": "BUY",
@@ -261,28 +439,44 @@ def build_signal(display_symbol):
     for name, interval in INTERVALS.items():
         df = get_market_data(
             api_symbol,
-            interval
+            interval,
         )
         if df is None:
+            print(
+                f"FAILED DATA | {display_symbol} | {name}"
+            )
             return None
         frames[name] = df
     m15 = analyze(frames["M15"])
     h1 = analyze(frames["H1"])
     h4 = analyze(frames["H4"])
+    m15_side = m15["side"] if m15 else "NONE"
+    h1_side = h1["side"] if h1 else "NONE"
+    h4_side = h4["side"] if h4 else "NONE"
+    print(
+        f"ANALYSIS | {display_symbol} | "
+        f"M15={m15_side} H1={h1_side} H4={h4_side}"
+    )
     if not m15 or not h1 or not h4:
         return None
-    # STRICT:
-    # M15 + H1 + H4 must agree.
+    # Strict M15 + H1 + H4 confirmation
     if not (
         m15["side"]
         == h1["side"]
         == h4["side"]
     ):
+        print(
+            f"NO SIGNAL | {display_symbol} | "
+            "Timeframes disagree"
+        )
         return None
     side = m15["side"]
     entry = m15["price"]
     atr_value = m15["atr"]
-    if not np.isfinite(atr_value) or atr_value <= 0:
+    if (
+        not np.isfinite(atr_value)
+        or atr_value <= 0
+    ):
         return None
     if side == "BUY":
         sl = entry - (
@@ -331,20 +525,22 @@ def signal_allowed(symbol, side):
 # DECIMAL FORMATTING
 # ============================================================
 def price_text(symbol, value):
-    if symbol == "BTCUSD.r":
-        return f"{value:.2f}"
-    if symbol == "XAUUSD.r":
+    if symbol in [
+        "BTCUSD.r",
+        "XAUUSD.r",
+    ]:
         return f"{value:.2f}"
     return f"{value:.5f}"
 # ============================================================
-# TELEGRAM MESSAGE
+# TELEGRAM SIGNAL MESSAGE
 # ============================================================
 def signal_message(signal):
     symbol = signal["symbol"]
-    if signal["side"] == "BUY":
-        emoji = "🟢"
-    else:
-        emoji = "🔴"
+    emoji = (
+        "🟢"
+        if signal["side"] == "BUY"
+        else "🔴"
+    )
     return f"""
 <b>{emoji} ADIL MTF SIGNAL</b>
 <b>Symbol:</b> {symbol}
@@ -366,23 +562,52 @@ def signal_message(signal):
 # SCANNER
 # ============================================================
 def scanner():
-    print(
-        "ADIL SIGNAL BOT STARTED"
-    )
-    print(
-        "Symbols:",
-        list(SYMBOLS.keys())
-    )
+    print("")
+    print("======================================")
+    print("ADIL SIGNAL BOT STARTED")
+    print("======================================")
+    print("Symbols:", list(SYMBOLS.keys()))
+    print("MIN_SCORE:", MIN_SCORE)
+    print("SCAN_SECONDS:", SCAN_SECONDS)
+    if not TWELVE_DATA_API_KEY:
+        print("ERROR: Twelve Data API key missing")
+    else:
+        print("TWELVE DATA STATUS: API KEY FOUND")
+    if not CHAT_ID:
+        print("ERROR: CHAT_ID missing")
+    else:
+        print("TELEGRAM CHAT_ID: CONFIGURED")
+    telegram_check()
+    # Send startup message
+    if CHAT_ID:
+        telegram_startup_message()
     while True:
+        cycle_start = time.time()
+        print("")
+        print("======================================")
+        print("NEW SCAN CYCLE")
+        print("======================================")
         for symbol in SYMBOLS:
             try:
                 signal = build_signal(symbol)
                 if not signal:
+                    print(
+                        f"{symbol}: No confirmed signal"
+                    )
                     continue
+                print(
+                    f"SIGNAL FOUND | "
+                    f"{symbol} | "
+                    f"{signal['side']} | "
+                    f"Score {signal['score']}"
+                )
                 if not signal_allowed(
                     signal["symbol"],
-                    signal["side"]
+                    signal["side"],
                 ):
+                    print(
+                        f"{symbol}: Cooldown active"
+                    )
                     continue
                 message = signal_message(
                     signal
@@ -392,16 +617,28 @@ def scanner():
             except Exception as e:
                 print(
                     f"Scanner error {symbol}:",
-                    e
+                    e,
                 )
-        # Scan once per minute
-        time.sleep(60)
+        elapsed = time.time() - cycle_start
+        sleep_time = max(
+            5,
+            SCAN_SECONDS - elapsed,
+        )
+        print(
+            f"Scan complete. "
+            f"Next scan in ~{sleep_time:.0f} seconds."
+        )
+        time.sleep(sleep_time)
 # ============================================================
 # START
 # ============================================================
 if __name__ == "__main__":
     Thread(
         target=flask_server,
-        daemon=True
+        daemon=True,
+    ).start()
+    Thread(
+        target=telegram_listener,
+        daemon=True,
     ).start()
     scanner()
