@@ -4,8 +4,6 @@ import time
 
 import threading
 
-from datetime import datetime, timedelta
-
 import requests
 
 import pandas as pd
@@ -42,33 +40,21 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
-if not BOT_TOKEN:
-
-    print("WARNING: BOT_TOKEN missing")
-
-if not CHAT_ID:
-
-    print("WARNING: CHAT_ID missing")
-
-if not TWELVE_DATA_API_KEY:
-
-    print("WARNING: TWELVE_DATA_API_KEY missing")
-
 SYMBOLS = {
 
     "XAUUSD.r": {
 
         "name": "GOLD",
 
-        "td_symbol": "XAU/USD",
+        "td": "XAU/USD",
 
     },
 
     "EURUSD.r": {
 
-        "name": "EUR",
+        "name": "EURUSD",
 
-        "td_symbol": "EUR/USD",
+        "td": "EUR/USD",
 
     },
 
@@ -76,29 +62,23 @@ SYMBOLS = {
 
         "name": "BTC",
 
-        "td_symbol": "BTC/USD",
+        "td": "BTC/USD",
 
     },
 
 }
 
-TIMEFRAMES = {
+SL_ATR_BUFFER = 0.25
 
-    "4h": "4h",
+TP1_R = 1.0
 
-    "1h": "1h",
+TP2_R = 2.0
 
-    "15m": "15min",
+TP3_R = 3.0
 
-}
+RISK_MIN = 0.5
 
-SL_ATR = 1.2
-
-TP1_ATR = 1.5
-
-TP2_ATR = 2.5
-
-TP3_ATR = 3.5
+RISK_MAX = 1.0
 
 SCAN_SECONDS = 300
 
@@ -108,15 +88,15 @@ SCAN_SECONDS = 300
 
 # ============================================================
 
-flask_app = Flask(__name__)
+app = Flask(__name__)
 
-@flask_app.route("/")
+@app.route("/")
 
 def home():
 
-    return "ADIL PRO MARKET MOOD v14 LIVE"
+    return "ADIL PRO TREND PULLBACK BOT LIVE"
 
-@flask_app.route("/health")
+@app.route("/health")
 
 def health():
 
@@ -126,7 +106,7 @@ def flask_loop():
 
     port = int(os.getenv("PORT", "10000"))
 
-    flask_app.run(
+    app.run(
 
         host="0.0.0.0",
 
@@ -142,7 +122,7 @@ def flask_loop():
 
 # ============================================================
 
-def send_telegram(message):
+def send_telegram(text):
 
     if not BOT_TOKEN or not CHAT_ID:
 
@@ -160,35 +140,25 @@ def send_telegram(message):
 
         )
 
-        payload = {
-
-            "chat_id": CHAT_ID,
-
-            "text": message,
-
-        }
-
-        response = requests.post(
+        r = requests.post(
 
             url,
 
-            json=payload,
+            json={
+
+                "chat_id": CHAT_ID,
+
+                "text": text,
+
+            },
 
             timeout=30,
 
         )
 
-        if response.status_code != 200:
+        if r.status_code != 200:
 
-            print(
-
-                "Telegram error:",
-
-                response.status_code,
-
-                response.text,
-
-            )
+            print("Telegram error:", r.text)
 
             return False
 
@@ -202,73 +172,47 @@ def send_telegram(message):
 
 # ============================================================
 
-# TWELVE DATA
+# DATA
 
 # ============================================================
 
-def get_candles(
-
-    symbol,
-
-    interval,
-
-    outputsize=250,
-
-):
-
-    """
-
-    Live data.
-
-    Twelve Data returns newest candles first by default.
-
-    We sort ascending and remove the currently forming candle.
-
-    """
-
-    if symbol not in SYMBOLS:
-
-        return None
-
-    td_symbol = SYMBOLS[symbol]["td_symbol"]
-
-    url = "https://api.twelvedata.com/time_series"
-
-    params = {
-
-        "symbol": td_symbol,
-
-        "interval": interval,
-
-        "outputsize": outputsize,
-
-        "apikey": TWELVE_DATA_API_KEY,
-
-        "format": "JSON",
-
-    }
+def get_data(symbol, interval, outputsize=250):
 
     try:
 
-        response = requests.get(
+        url = "https://api.twelvedata.com/time_series"
+
+        params = {
+
+            "symbol": SYMBOLS[symbol]["td"],
+
+            "interval": interval,
+
+            "outputsize": outputsize,
+
+            "apikey": TWELVE_DATA_API_KEY,
+
+            "format": "JSON",
+
+        }
+
+        r = requests.get(
 
             url,
 
             params=params,
 
-            timeout=30,
+            timeout=40,
 
         )
 
-        data = response.json()
+        data = r.json()
 
         if "values" not in data:
 
             print(
 
-                f"TWELVE DATA LIVE ERROR "
-
-                f"{symbol} {interval}: "
+                f"DATA ERROR {symbol} {interval}: "
 
                 f"{data}"
 
@@ -304,7 +248,7 @@ def get_candles(
 
         ]:
 
-            if col in df.columns:
+            if col in df:
 
                 df[col] = pd.to_numeric(
 
@@ -342,9 +286,9 @@ def get_candles(
 
         )
 
-        # Last candle may still be forming.
+        # Remove current unfinished candle.
 
-        if len(df) > 2:
+        if len(df) > 3:
 
             df = df.iloc[:-1].copy()
 
@@ -354,7 +298,7 @@ def get_candles(
 
         print(
 
-            f"GET CANDLES ERROR "
+            f"GET DATA ERROR "
 
             f"{symbol} {interval}: {e}"
 
@@ -368,23 +312,15 @@ def get_candles(
 
 # ============================================================
 
-def add_indicators(df):
+def indicators(df):
 
-    df = df.copy()
-
-    if len(df) < 210:
+    if df is None or len(df) < 220:
 
         return None
 
+    df = df.copy()
+
     close = df["close"]
-
-    df["ema21"] = close.ewm(
-
-        span=21,
-
-        adjust=False,
-
-    ).mean()
 
     df["ema50"] = close.ewm(
 
@@ -402,7 +338,7 @@ def add_indicators(df):
 
     ).mean()
 
-    # RSI 14
+    # RSI
 
     delta = close.diff()
 
@@ -434,49 +370,35 @@ def add_indicators(df):
 
     )
 
-    df["rsi"] = 100 - (
+    df["rsi"] = (
 
-        100 / (1 + rs)
-
-    )
-
-    # True Range / ATR
-
-    previous_close = close.shift(1)
-
-    tr1 = (
-
-        df["high"] - df["low"]
+        100 - (100 / (1 + rs))
 
     )
 
-    tr2 = (
+    # ATR
 
-        df["high"] - previous_close
+    prev_close = close.shift(1)
 
-    ).abs()
+    tr = pd.concat(
 
-    tr3 = (
+        [
 
-        df["low"] - previous_close
+            df["high"] - df["low"],
 
-    ).abs()
+            (df["high"] - prev_close).abs(),
 
-    df["tr"] = pd.concat(
+            (df["low"] - prev_close).abs(),
 
-        [tr1, tr2, tr3],
+        ],
 
         axis=1,
 
     ).max(axis=1)
 
-    df["atr"] = df["tr"].rolling(
+    df["atr"] = tr.rolling(14).mean()
 
-        14
-
-    ).mean()
-
-    # Simple momentum
+    # Momentum
 
     df["momentum"] = (
 
@@ -492,35 +414,91 @@ def add_indicators(df):
 
 # ============================================================
 
-# TREND
+# MARKET STRUCTURE
 
 # ============================================================
 
-def timeframe_trend(df):
+def structure(df, lookback=3):
 
-    if df is None or len(df) < 2:
+    if df is None or len(df) < 20:
+
+        return "NEUTRAL"
+
+    recent = df.iloc[
+
+        -lookback * 4:
+
+    ].copy()
+
+    highs = recent["high"].values
+
+    lows = recent["low"].values
+
+    if len(highs) < 8:
+
+        return "NEUTRAL"
+
+    # Simple recent swing structure.
+
+    h1 = max(highs[: len(highs)//2])
+
+    h2 = max(highs[len(highs)//2:])
+
+    l1 = min(lows[: len(lows)//2])
+
+    l2 = min(lows[len(lows)//2:])
+
+    if h2 > h1 and l2 > l1:
+
+        return "BULLISH"
+
+    if h2 < h1 and l2 < l1:
+
+        return "BEARISH"
+
+    return "NEUTRAL"
+
+# ============================================================
+
+# HIGHER TIMEFRAME TREND
+
+# ============================================================
+
+def get_trend(df):
+
+    if df is None or len(df) < 5:
 
         return "WAIT"
 
     row = df.iloc[-1]
 
-    if (
+    st = structure(df)
 
-        row["ema21"] > row["ema50"]
+    bullish = (
 
-        and row["close"] > row["ema200"]
+        row["close"] > row["ema200"]
 
-    ):
+        and row["ema50"] > row["ema200"]
+
+        and st == "BULLISH"
+
+    )
+
+    bearish = (
+
+        row["close"] < row["ema200"]
+
+        and row["ema50"] < row["ema200"]
+
+        and st == "BEARISH"
+
+    )
+
+    if bullish:
 
         return "BUY"
 
-    if (
-
-        row["ema21"] < row["ema50"]
-
-        and row["close"] < row["ema200"]
-
-    ):
+    if bearish:
 
         return "SELL"
 
@@ -528,235 +506,593 @@ def timeframe_trend(df):
 
 # ============================================================
 
-# 15M ENTRY CONFIRMATION
+# 1H PULLBACK
 
 # ============================================================
 
-def entry_confirmation(df):
+def pullback_confirmation(
 
-    if df is None or len(df) < 3:
+    df,
 
-        return "WAIT"
+    direction,
+
+):
+
+    if df is None or len(df) < 10:
+
+        return False
 
     row = df.iloc[-1]
 
     prev = df.iloc[-2]
 
-    # --------------------------------------------------------
+    atr = row["atr"]
 
-    # BUY
+    if not np.isfinite(atr) or atr <= 0:
 
-    # --------------------------------------------------------
+        return False
 
-    buy = (
+    # BUY:
 
-        row["ema21"] > row["ema50"]
+    # trend remains bullish but price pulls
 
-        and row["close"] > row["ema200"]
+    # toward EMA50 / EMA200 area.
 
-        and 50 <= row["rsi"] <= 68
+    if direction == "BUY":
 
-        and row["momentum"] > 0
+        near_ema50 = abs(
 
-        and row["close"] > prev["close"]
+            row["close"] - row["ema50"]
 
-        and row["close"] > row["ema21"]
+        ) <= atr * 1.5
 
-    )
+        previous_pullback = (
 
-    if buy:
+            prev["low"] <= prev["ema50"]
 
-        return "BUY"
+            or prev["close"] < prev["ema50"]
 
-    # --------------------------------------------------------
+        )
+
+        recovered = (
+
+            row["close"] > row["ema50"]
+
+        )
+
+        return (
+
+            near_ema50
+
+            or (
+
+                previous_pullback
+
+                and recovered
+
+            )
+
+        )
 
     # SELL
 
-    # --------------------------------------------------------
+    if direction == "SELL":
 
-    sell = (
+        near_ema50 = abs(
 
-        row["ema21"] < row["ema50"]
+            row["close"] - row["ema50"]
 
-        and row["close"] < row["ema200"]
+        ) <= atr * 1.5
 
-        and 32 <= row["rsi"] <= 50
+        previous_pullback = (
 
-        and row["momentum"] < 0
+            prev["high"] >= prev["ema50"]
 
-        and row["close"] < prev["close"]
+            or prev["close"] > prev["ema50"]
 
-        and row["close"] < row["ema21"]
+        )
+
+        rejected = (
+
+            row["close"] < row["ema50"]
+
+        )
+
+        return (
+
+            near_ema50
+
+            or (
+
+                previous_pullback
+
+                and rejected
+
+            )
+
+        )
+
+    return False
+
+# ============================================================
+
+# 15M BREAK OF STRUCTURE
+
+# ============================================================
+
+def entry_confirmation(
+
+    df,
+
+    direction,
+
+):
+
+    if df is None or len(df) < 30:
+
+        return None
+
+    row = df.iloc[-1]
+
+    prev = df.iloc[-2]
+
+    lookback = df.iloc[-8:-2]
+
+    recent_high = lookback["high"].max()
+
+    recent_low = lookback["low"].min()
+
+    # BUY BOS
+
+    if direction == "BUY":
+
+        bos = (
+
+            row["close"] > recent_high
+
+            and prev["close"] <= recent_high
+
+        )
+
+        momentum = (
+
+            row["momentum"] > 0
+
+        )
+
+        candle = (
+
+            row["close"] > prev["close"]
+
+            and row["close"] > row["open"]
+
+        )
+
+        trend = (
+
+            row["close"] > row["ema50"]
+
+            and row["ema50"] > row["ema200"]
+
+        )
+
+        rsi_ok = (
+
+            50 <= row["rsi"] <= 70
+
+        )
+
+        if (
+
+            bos
+
+            and momentum
+
+            and candle
+
+            and trend
+
+            and rsi_ok
+
+        ):
+
+            return "BUY"
+
+    # SELL BOS
+
+    if direction == "SELL":
+
+        bos = (
+
+            row["close"] < recent_low
+
+            and prev["close"] >= recent_low
+
+        )
+
+        momentum = (
+
+            row["momentum"] < 0
+
+        )
+
+        candle = (
+
+            row["close"] < prev["close"]
+
+            and row["close"] < row["open"]
+
+        )
+
+        trend = (
+
+            row["close"] < row["ema50"]
+
+            and row["ema50"] < row["ema200"]
+
+        )
+
+        rsi_ok = (
+
+            30 <= row["rsi"] <= 50
+
+        )
+
+        if (
+
+            bos
+
+            and momentum
+
+            and candle
+
+            and trend
+
+            and rsi_ok
+
+        ):
+
+            return "SELL"
+
+    return None
+
+# ============================================================
+
+# TRADE LEVELS
+
+# ============================================================
+
+def make_trade(
+
+    df15,
+
+    direction,
+
+):
+
+    row = df15.iloc[-1]
+
+    entry = float(row["close"])
+
+    atr = float(row["atr"])
+
+    recent_low = float(
+
+        df15.iloc[-8:-1]["low"].min()
 
     )
 
-    if sell:
+    recent_high = float(
 
-        return "SELL"
+        df15.iloc[-8:-1]["high"].max()
 
-    return "WAIT"
+    )
+
+    if direction == "BUY":
+
+        structure_sl = (
+
+            recent_low
+
+            - atr * SL_ATR_BUFFER
+
+        )
+
+        atr_sl = (
+
+            entry - atr * 1.2
+
+        )
+
+        # Use the wider logical stop.
+
+        sl = min(
+
+            structure_sl,
+
+            atr_sl,
+
+        )
+
+        risk = entry - sl
+
+        if risk <= 0:
+
+            return None
+
+        tp1 = entry + risk * TP1_R
+
+        tp2 = entry + risk * TP2_R
+
+        tp3 = entry + risk * TP3_R
+
+    else:
+
+        structure_sl = (
+
+            recent_high
+
+            + atr * SL_ATR_BUFFER
+
+        )
+
+        atr_sl = (
+
+            entry + atr * 1.2
+
+        )
+
+        sl = max(
+
+            structure_sl,
+
+            atr_sl,
+
+        )
+
+        risk = sl - entry
+
+        if risk <= 0:
+
+            return None
+
+        tp1 = entry - risk * TP1_R
+
+        tp2 = entry - risk * TP2_R
+
+        tp3 = entry - risk * TP3_R
+
+    return {
+
+        "direction": direction,
+
+        "entry": entry,
+
+        "sl": sl,
+
+        "tp1": tp1,
+
+        "tp2": tp2,
+
+        "tp3": tp3,
+
+        "risk_distance": risk,
+
+        "atr": atr,
+
+        "candle": row["datetime"],
+
+    }
 
 # ============================================================
 
-# FULL SYMBOL ANALYSIS
+# COMPLETE ANALYSIS
 
 # ============================================================
 
-def analyze_symbol(symbol):
+def analyze(symbol):
 
-    try:
+    df4 = get_data(
 
-        data_4h = get_candles(
+        symbol,
 
-            symbol,
+        "4h",
 
-            TIMEFRAMES["4h"],
+        300,
 
-            250,
+    )
 
-        )
+    df1 = get_data(
 
-        data_1h = get_candles(
+        symbol,
 
-            symbol,
+        "1h",
 
-            TIMEFRAMES["1h"],
+        300,
 
-            250,
+    )
 
-        )
+    df15 = get_data(
 
-        data_15m = get_candles(
+        symbol,
 
-            symbol,
+        "15min",
 
-            TIMEFRAMES["15m"],
+        300,
 
-            250,
+    )
 
-        )
+    if (
 
-        if (
+        df4 is None
 
-            data_4h is None
+        or df1 is None
 
-            or data_1h is None
+        or df15 is None
 
-            or data_15m is None
-
-        ):
-
-            return {
-
-                "signal": "WAIT",
-
-                "reason": "DATA_ERROR",
-
-            }
-
-        data_4h = add_indicators(data_4h)
-
-        data_1h = add_indicators(data_1h)
-
-        data_15m = add_indicators(data_15m)
-
-        if (
-
-            data_4h is None
-
-            or data_1h is None
-
-            or data_15m is None
-
-        ):
-
-            return {
-
-                "signal": "WAIT",
-
-                "reason": "NOT_ENOUGH_DATA",
-
-            }
-
-        trend_4h = timeframe_trend(data_4h)
-
-        trend_1h = timeframe_trend(data_1h)
-
-        entry_15m = entry_confirmation(data_15m)
-
-        row = data_15m.iloc[-1]
-
-        # Higher timeframe agreement is mandatory.
-
-        if trend_4h == "WAIT":
-
-            signal = "WAIT"
-
-            reason = "4H trend unclear"
-
-        elif trend_1h == "WAIT":
-
-            signal = "WAIT"
-
-            reason = "1H trend unclear"
-
-        elif trend_4h != trend_1h:
-
-            signal = "WAIT"
-
-            reason = "4H / 1H conflict"
-
-        elif entry_15m != trend_4h:
-
-            signal = "WAIT"
-
-            reason = "15M confirmation missing"
-
-        else:
-
-            signal = entry_15m
-
-            reason = "4H + 1H + 15M confirmed"
-
-        return {
-
-            "signal": signal,
-
-            "reason": reason,
-
-            "trend_4h": trend_4h,
-
-            "trend_1h": trend_1h,
-
-            "entry_15m": entry_15m,
-
-            "price": float(row["close"]),
-
-            "atr": float(row["atr"]),
-
-            "rsi": float(row["rsi"]),
-
-            "momentum": float(row["momentum"]),
-
-            "candle_time": row["datetime"],
-
-        }
-
-    except Exception as e:
-
-        print(
-
-            f"ANALYSIS ERROR {symbol}: {e}"
-
-        )
+    ):
 
         return {
 
             "signal": "WAIT",
 
-            "reason": "ANALYSIS_ERROR",
+            "reason": "DATA_ERROR",
 
         }
+
+    df4 = indicators(df4)
+
+    df1 = indicators(df1)
+
+    df15 = indicators(df15)
+
+    if (
+
+        df4 is None
+
+        or df1 is None
+
+        or df15 is None
+
+    ):
+
+        return {
+
+            "signal": "WAIT",
+
+            "reason": "NOT_ENOUGH_DATA",
+
+        }
+
+    trend4 = get_trend(df4)
+
+    trend1 = get_trend(df1)
+
+    if trend4 == "WAIT":
+
+        return {
+
+            "signal": "WAIT",
+
+            "reason": "4H trend unclear",
+
+            "trend4": trend4,
+
+            "trend1": trend1,
+
+        }
+
+    if trend1 != trend4:
+
+        return {
+
+            "signal": "WAIT",
+
+            "reason": "4H / 1H trend conflict",
+
+            "trend4": trend4,
+
+            "trend1": trend1,
+
+        }
+
+    pullback = pullback_confirmation(
+
+        df1,
+
+        trend4,
+
+    )
+
+    if not pullback:
+
+        return {
+
+            "signal": "WAIT",
+
+            "reason": "1H pullback not ready",
+
+            "trend4": trend4,
+
+            "trend1": trend1,
+
+        }
+
+    entry = entry_confirmation(
+
+        df15,
+
+        trend4,
+
+    )
+
+    if entry != trend4:
+
+        return {
+
+            "signal": "WAIT",
+
+            "reason": "15M BOS confirmation missing",
+
+            "trend4": trend4,
+
+            "trend1": trend1,
+
+        }
+
+    trade = make_trade(
+
+        df15,
+
+        trend4,
+
+    )
+
+    if trade is None:
+
+        return {
+
+            "signal": "WAIT",
+
+            "reason": "Invalid trade levels",
+
+            "trend4": trend4,
+
+            "trend1": trend1,
+
+        }
+
+    row = df15.iloc[-1]
+
+    return {
+
+        "signal": trend4,
+
+        "reason": (
+
+            "4H trend + 1H pullback + "
+
+            "15M BOS confirmed"
+
+        ),
+
+        "trend4": trend4,
+
+        "trend1": trend1,
+
+        "pullback": True,
+
+        "rsi": float(row["rsi"]),
+
+        "momentum": float(row["momentum"]),
+
+        "price": float(row["close"]),
+
+        "candle": row["datetime"],
+
+        "trade": trade,
+
+    }
 
 # ============================================================
 
@@ -764,75 +1100,29 @@ def analyze_symbol(symbol):
 
 # ============================================================
 
-def signal_message(symbol, result):
+def signal_message(
+
+    symbol,
+
+    result,
+
+):
+
+    trade = result["trade"]
 
     name = SYMBOLS[symbol]["name"]
 
-    direction = result["signal"]
+    direction = trade["direction"]
 
-    price = result["price"]
+    emoji = (
 
-    atr = result["atr"]
+        "🟢"
 
-    if direction == "BUY":
+        if direction == "BUY"
 
-        sl = price - (
+        else "🔴"
 
-            SL_ATR * atr
-
-        )
-
-        tp1 = price + (
-
-            TP1_ATR * atr
-
-        )
-
-        tp2 = price + (
-
-            TP2_ATR * atr
-
-        )
-
-        tp3 = price + (
-
-            TP3_ATR * atr
-
-        )
-
-        emoji = "🟢"
-
-    elif direction == "SELL":
-
-        sl = price + (
-
-            SL_ATR * atr
-
-        )
-
-        tp1 = price - (
-
-            TP1_ATR * atr
-
-        )
-
-        tp2 = price - (
-
-            TP2_ATR * atr
-
-        )
-
-        tp3 = price - (
-
-            TP3_ATR * atr
-
-        )
-
-        emoji = "🔴"
-
-    else:
-
-        return None
+    )
 
     return (
 
@@ -842,25 +1132,31 @@ def signal_message(symbol, result):
 
         f"📊 {name} ({symbol})\n\n"
 
-        f"💰 Entry: {price:.5f}\n\n"
+        f"💰 Entry: {trade['entry']:.5f}\n"
 
-        f"🛑 SL: {sl:.5f}\n"
+        f"🛑 SL: {trade['sl']:.5f}\n\n"
 
-        f"🎯 TP1: {tp1:.5f}\n"
+        f"🎯 TP1: {trade['tp1']:.5f}\n"
 
-        f"🎯 TP2: {tp2:.5f}\n"
+        f"🎯 TP2: {trade['tp2']:.5f}\n"
 
-        f"🎯 TP3: {tp3:.5f}\n\n"
+        f"🎯 TP3: {trade['tp3']:.5f}\n\n"
 
-        f"📈 4H: {result['trend_4h']}\n"
+        f"📈 4H Trend: {result['trend4']}\n"
 
-        f"📈 1H: {result['trend_1h']}\n"
+        f"📈 1H Trend: {result['trend1']}\n"
 
-        f"⚡ 15M: {result['entry_15m']}\n"
+        f"🔄 1H Pullback: CONFIRMED\n"
+
+        f"⚡ 15M BOS: CONFIRMED\n"
 
         f"RSI: {result['rsi']:.1f}\n\n"
 
         f"🧠 {result['reason']}\n\n"
+
+        f"⚠️ Suggested risk: "
+
+        f"{RISK_MIN:.1f}%–{RISK_MAX:.1f}%\n"
 
         f"📡 Data: Twelve Data public feed\n"
 
@@ -868,17 +1164,15 @@ def signal_message(symbol, result):
 
         f"🖐 Execution: Manual\n\n"
 
-        f"⚠️ Twelve Data price may differ from "
+        f"⚠️ Twelve Data price may differ "
 
-        f"Lirunex MT5.\n"
-
-        f"⚠️ No guaranteed profit."
+        f"from Lirunex MT5."
 
     )
 
 # ============================================================
 
-# MARKET REPORT
+# MARKET
 
 # ============================================================
 
@@ -886,55 +1180,53 @@ def market_report():
 
     lines = [
 
-        "📊 MARKET REPORT",
+        "📊 PRO MARKET CHECK",
 
         "━━━━━━━━━━━━━━━━━━",
+
+        "",
 
     ]
 
     for symbol in SYMBOLS:
 
-        result = analyze_symbol(symbol)
+        result = analyze(symbol)
 
-        name = SYMBOLS[symbol]["name"]
+        signal = result.get(
 
-        signal = result.get("signal", "WAIT")
+            "signal",
 
-        if signal == "BUY":
+            "WAIT",
 
-            icon = "🟢"
+        )
 
-        elif signal == "SELL":
+        icon = {
 
-            icon = "🔴"
+            "BUY": "🟢",
 
-        else:
+            "SELL": "🔴",
 
-            icon = "⚪"
+            "WAIT": "⚪",
+
+        }.get(signal, "⚪")
 
         lines.append(
 
-            f"{icon} {name} ({symbol})"
+            f"{icon} {SYMBOLS[symbol]['name']}"
 
         )
 
         lines.append(
 
-            f"4H: {result.get('trend_4h', 'WAIT')} | "
-
-            f"1H: {result.get('trend_1h', 'WAIT')} | "
-
-            f"15M: {result.get('entry_15m', 'WAIT')}"
+            f"4H: {result.get('trend4', 'WAIT')}"
 
         )
 
-        if "price" in result:
+        lines.append(
 
-            lines.append(
+            f"1H: {result.get('trend1', 'WAIT')}"
 
-                f"Price: {result['price']:.5f}"
-
-            )
+        )
 
         lines.append(
 
@@ -942,7 +1234,17 @@ def market_report():
 
         )
 
+        lines.append(
+
+            f"Reason: "
+
+            f"{result.get('reason', '-')}"
+
+        )
+
         lines.append("")
+
+        time.sleep(1)
 
     lines.extend(
 
@@ -950,17 +1252,11 @@ def market_report():
 
             "━━━━━━━━━━━━━━━━━━",
 
-            "📡 Data: Twelve Data public feed",
+            "📡 Twelve Data public feed",
 
-            "🏦 Broker: Lirunex MT5",
+            "🏦 Lirunex MT5",
 
-            "🖐 Execution: Manual",
-
-            "",
-
-            "⚠️ Public feed prices may differ "
-
-            "from Lirunex MT5.",
+            "🖐 Manual execution",
 
         ]
 
@@ -974,87 +1270,61 @@ def market_report():
 
 # ============================================================
 
-last_sent = {}
+sent_signals = set()
 
-def should_send_signal(
+def new_signal(
 
     symbol,
 
-    signal,
+    direction,
 
-    candle_time,
+    candle,
 
 ):
-
-    if signal not in [
-
-        "BUY",
-
-        "SELL",
-
-    ]:
-
-        return False
 
     key = (
 
         symbol,
 
-        signal,
+        direction,
 
-        str(candle_time),
+        str(candle),
 
     )
 
-    if key in last_sent:
+    if key in sent_signals:
 
         return False
 
-    last_sent[key] = True
+    sent_signals.add(key)
 
-    # Keep dictionary from growing forever.
+    if len(sent_signals) > 300:
 
-    if len(last_sent) > 200:
-
-        first_key = next(
-
-            iter(last_sent)
-
-        )
-
-        del last_sent[first_key]
+        sent_signals.pop()
 
     return True
 
 # ============================================================
 
-# LIVE SCANNER
+# SCANNER
 
 # ============================================================
 
 def scanner_loop():
 
-    print("Scanner started.")
+    print(
+
+        "PRO TREND PULLBACK SCANNER STARTED"
+
+    )
 
     while True:
 
         try:
 
-            print(
-
-                f"Scanner check: "
-
-                f"{datetime.utcnow()}"
-
-            )
-
             for symbol in SYMBOLS:
 
-                result = analyze_symbol(
-
-                    symbol
-
-                )
+                result = analyze(symbol)
 
                 signal = result.get(
 
@@ -1064,61 +1334,49 @@ def scanner_loop():
 
                 )
 
-                candle_time = result.get(
-
-                    "candle_time"
-
-                )
-
                 print(
 
-                    f"{symbol}: "
+                    f"{symbol}: {signal} | "
 
-                    f"{signal}"
+                    f"{result.get('reason', '')}"
 
                 )
 
-                if (
+                if signal in [
 
-                    signal in [
+                    "BUY",
 
-                        "BUY",
+                    "SELL",
 
-                        "SELL",
+                ]:
 
-                    ]
+                    candle = result.get(
 
-                    and candle_time is not None
+                        "candle"
 
-                ):
+                    )
 
-                    if should_send_signal(
+                    if candle and new_signal(
 
                         symbol,
 
                         signal,
 
-                        candle_time,
+                        candle,
 
                     ):
 
-                        message = signal_message(
+                        send_telegram(
 
-                            symbol,
+                            signal_message(
 
-                            result,
+                                symbol,
 
-                        )
-
-                        if message:
-
-                            send_telegram(
-
-                                message
+                                result,
 
                             )
 
-                # Avoid hammering API.
+                        )
 
                 time.sleep(2)
 
@@ -1144,7 +1402,7 @@ def scanner_loop():
 
 # ============================================================
 
-def get_backtest_data(
+def historical_data(
 
     symbol,
 
@@ -1153,20 +1411,6 @@ def get_backtest_data(
     days=90,
 
 ):
-
-    """
-
-    Historical data fetch.
-
-    Twelve Data max outputsize is 5000.
-
-    Therefore 15M data is split into chunks.
-
-    """
-
-    if symbol not in SYMBOLS:
-
-        return None
 
     try:
 
@@ -1184,26 +1428,6 @@ def get_backtest_data(
 
         )
 
-        # Maximum safe chunks.
-
-        #
-
-        # 15M:
-
-        # 25 days ~= 2400 candles
-
-        #
-
-        # 1H:
-
-        # 60 days ~= 1440 candles
-
-        #
-
-        # 4H:
-
-        # 90 days ~= 540 candles
-
         chunk_days = {
 
             "15min": 25,
@@ -1212,23 +1436,21 @@ def get_backtest_data(
 
             "4h": 90,
 
-        }
+        }[interval]
 
-        chunk = chunk_days[interval]
-
-        all_parts = []
+        parts = []
 
         current = start
 
         while current < now:
 
-            current_end = min(
+            end = min(
 
                 current
 
                 + pd.Timedelta(
 
-                    days=chunk
+                    days=chunk_days
 
                 ),
 
@@ -1246,11 +1468,7 @@ def get_backtest_data(
 
             params = {
 
-                "symbol": SYMBOLS[symbol][
-
-                    "td_symbol"
-
-                ],
+                "symbol": SYMBOLS[symbol]["td"],
 
                 "interval": interval,
 
@@ -1260,7 +1478,7 @@ def get_backtest_data(
 
                 ),
 
-                "end_date": current_end.strftime(
+                "end_date": end.strftime(
 
                     "%Y-%m-%dT%H:%M:%S"
 
@@ -1276,17 +1494,17 @@ def get_backtest_data(
 
             print(
 
-                f"BACKTEST FETCH "
+                f"BACKTEST "
 
-                f"{symbol} {interval} "
+                f"{symbol} {interval}: "
 
                 f"{current.date()} -> "
 
-                f"{current_end.date()}"
+                f"{end.date()}"
 
             )
 
-            response = requests.get(
+            r = requests.get(
 
                 url,
 
@@ -1296,33 +1514,17 @@ def get_backtest_data(
 
             )
 
-            try:
-
-                data = response.json()
-
-            except Exception:
-
-                print(
-
-                    "INVALID JSON:",
-
-                    response.text[:500],
-
-                )
-
-                return None
+            data = r.json()
 
             if "values" not in data:
 
                 print(
 
-                    "TWELVE DATA "
+                    "BACKTEST API ERROR:",
 
-                    "BACKTEST ERROR:"
+                    data,
 
                 )
-
-                print(data)
 
                 return None
 
@@ -1332,51 +1534,17 @@ def get_backtest_data(
 
             )
 
-            if part.empty:
+            if not part.empty:
 
-                current = current_end
+                part["datetime"] = pd.to_datetime(
 
-                time.sleep(1)
+                    part["datetime"],
 
-                continue
+                    errors="coerce",
 
-            part["datetime"] = pd.to_datetime(
+                )
 
-                part["datetime"],
-
-                errors="coerce",
-
-            )
-
-            for col in [
-
-                "open",
-
-                "high",
-
-                "low",
-
-                "close",
-
-                "volume",
-
-            ]:
-
-                if col in part.columns:
-
-                    part[col] = pd.to_numeric(
-
-                        part[col],
-
-                        errors="coerce",
-
-                    )
-
-            part = part.dropna(
-
-                subset=[
-
-                    "datetime",
+                for col in [
 
                     "open",
 
@@ -1386,33 +1554,47 @@ def get_backtest_data(
 
                     "close",
 
-                ]
+                ]:
 
-            )
+                    part[col] = pd.to_numeric(
 
-            all_parts.append(part)
+                        part[col],
 
-            current = current_end
+                        errors="coerce",
 
-            # Rate-limit protection.
+                    )
+
+                part = part.dropna(
+
+                    subset=[
+
+                        "datetime",
+
+                        "open",
+
+                        "high",
+
+                        "low",
+
+                        "close",
+
+                    ]
+
+                )
+
+                parts.append(part)
+
+            current = end
 
             time.sleep(2)
 
-        if not all_parts:
-
-            print(
-
-                f"NO DATA: "
-
-                f"{symbol} {interval}"
-
-            )
+        if not parts:
 
             return None
 
         df = pd.concat(
 
-            all_parts,
+            parts,
 
             ignore_index=True,
 
@@ -1422,7 +1604,7 @@ def get_backtest_data(
 
             df.drop_duplicates(
 
-                subset=["datetime"]
+                "datetime"
 
             )
 
@@ -1432,29 +1614,13 @@ def get_backtest_data(
 
         )
 
-        # We don't want future/current candle.
-
-        df = df[
-
-            df["datetime"] <= now
-
-        ].copy()
-
-        # Remove last candle because it may be incomplete.
-
         if len(df) > 2:
 
-            df = df.iloc[:-1].copy()
-
-        df = df.reset_index(
-
-            drop=True
-
-        )
+            df = df.iloc[:-1]
 
         print(
 
-            f"BACKTEST DATA OK "
+            f"BACKTEST READY "
 
             f"{symbol} {interval}: "
 
@@ -1462,15 +1628,19 @@ def get_backtest_data(
 
         )
 
-        return df
+        return df.reset_index(
+
+            drop=True
+
+        )
 
     except Exception as e:
 
         print(
 
-            f"BACKTEST DATA ERROR "
+            "HISTORICAL DATA ERROR:",
 
-            f"{symbol} {interval}: {e}"
+            e,
 
         )
 
@@ -1478,89 +1648,49 @@ def get_backtest_data(
 
 # ============================================================
 
-# PREPARE BACKTEST
+# BACKTEST HELPERS
 
 # ============================================================
 
-def prepare_backtest(symbol):
+def latest_before(
 
-    df15 = get_backtest_data(
+    df,
 
-        symbol,
+    timestamp,
 
-        "15min",
+):
 
-        90,
+    x = df[
 
-    )
+        df["datetime"] <= timestamp
 
-    df1h = get_backtest_data(
+    ]
 
-        symbol,
-
-        "1h",
-
-        90,
-
-    )
-
-    df4h = get_backtest_data(
-
-        symbol,
-
-        "4h",
-
-        90,
-
-    )
-
-    if (
-
-        df15 is None
-
-        or df1h is None
-
-        or df4h is None
-
-    ):
+    if x.empty:
 
         return None
 
-    df15 = add_indicators(df15)
+    return x.iloc[-1]
 
-    df1h = add_indicators(df1h)
+def backtest_trend(
 
-    df4h = add_indicators(df4h)
+    df,
 
-    if (
+    timestamp,
 
-        df15 is None
+):
 
-        or df1h is None
+    row = latest_before(
 
-        or df4h is None
+        df,
 
-    ):
+        timestamp,
 
-        return None
+    )
 
-    return {
+    if row is None:
 
-        "15m": df15,
-
-        "1h": df1h,
-
-        "4h": df4h,
-
-    }
-
-# ============================================================
-
-# HISTORICAL TREND AT TIMESTAMP
-
-# ============================================================
-
-def trend_at(df, timestamp):
+        return "WAIT"
 
     available = df[
 
@@ -1568,17 +1698,23 @@ def trend_at(df, timestamp):
 
     ]
 
-    if len(available) == 0:
+    if len(available) < 20:
 
         return "WAIT"
 
-    row = available.iloc[-1]
+    st = structure(
+
+        available
+
+    )
 
     if (
 
-        row["ema21"] > row["ema50"]
+        row["close"] > row["ema200"]
 
-        and row["close"] > row["ema200"]
+        and row["ema50"] > row["ema200"]
+
+        and st == "BULLISH"
 
     ):
 
@@ -1586,9 +1722,11 @@ def trend_at(df, timestamp):
 
     if (
 
-        row["ema21"] < row["ema50"]
+        row["close"] < row["ema200"]
 
-        and row["close"] < row["ema200"]
+        and row["ema50"] < row["ema200"]
+
+        and st == "BEARISH"
 
     ):
 
@@ -1596,123 +1734,129 @@ def trend_at(df, timestamp):
 
     return "WAIT"
 
-# ============================================================
+def backtest_pullback(
 
-# BACKTEST ENTRY
+    df,
 
-# ============================================================
+    timestamp,
 
-def backtest_entry(
-
-    data,
-
-    i,
+    direction,
 
 ):
 
-    df15 = data["15m"]
+    available = df[
 
-    df1h = data["1h"]
+        df["datetime"] <= timestamp
 
-    df4h = data["4h"]
+    ]
 
-    if i < 2:
+    if len(available) < 10:
 
-        return None
+        return False
 
-    row = df15.iloc[i]
+    return pullback_confirmation(
 
-    prev = df15.iloc[i - 1]
+        available,
 
-    timestamp = row["datetime"]
-
-    trend4 = trend_at(
-
-        df4h,
-
-        timestamp,
+        direction,
 
     )
 
-    trend1 = trend_at(
+def backtest_entry(
 
-        df1h,
+    df,
 
-        timestamp,
+    i,
 
-    )
+    direction,
 
-    # Higher timeframes must agree.
+):
 
-    if trend4 == "WAIT":
-
-        return None
-
-    if trend1 == "WAIT":
+    if i < 10:
 
         return None
 
-    if trend4 != trend1:
+    row = df.iloc[i]
 
-        return None
+    prev = df.iloc[i - 1]
 
-    # --------------------------------------------------------
+    lookback = df.iloc[
 
-    # BUY
+        i - 8:i - 2
 
-    # --------------------------------------------------------
+    ]
 
-    buy = (
+    recent_high = (
 
-        row["ema21"] > row["ema50"]
-
-        and row["close"] > row["ema200"]
-
-        and 50 <= row["rsi"] <= 68
-
-        and row["momentum"] > 0
-
-        and row["close"] > prev["close"]
-
-        and row["close"] > row["ema21"]
+        lookback["high"].max()
 
     )
 
-    # --------------------------------------------------------
+    recent_low = (
 
-    # SELL
-
-    # --------------------------------------------------------
-
-    sell = (
-
-        row["ema21"] < row["ema50"]
-
-        and row["close"] < row["ema200"]
-
-        and 32 <= row["rsi"] <= 50
-
-        and row["momentum"] < 0
-
-        and row["close"] < prev["close"]
-
-        and row["close"] < row["ema21"]
+        lookback["low"].min()
 
     )
 
-    if not buy and not sell:
+    if direction == "BUY":
 
-        return None
+        bos = (
 
-    direction = (
+            row["close"] > recent_high
 
-        "BUY"
+            and prev["close"] <= recent_high
 
-        if buy
+        )
 
-        else "SELL"
+        valid = (
 
-    )
+            bos
+
+            and row["momentum"] > 0
+
+            and row["close"] > row["open"]
+
+            and row["close"] > row["ema50"]
+
+            and row["ema50"] > row["ema200"]
+
+            and 50 <= row["rsi"] <= 70
+
+        )
+
+        if not valid:
+
+            return None
+
+    else:
+
+        bos = (
+
+            row["close"] < recent_low
+
+            and prev["close"] >= recent_low
+
+        )
+
+        valid = (
+
+            bos
+
+            and row["momentum"] < 0
+
+            and row["close"] < row["open"]
+
+            and row["close"] < row["ema50"]
+
+            and row["ema50"] < row["ema200"]
+
+            and 30 <= row["rsi"] <= 50
+
+        )
+
+        if not valid:
+
+            return None
 
     entry = float(
 
@@ -1726,71 +1870,61 @@ def backtest_entry(
 
     )
 
-    if not np.isfinite(atr):
+    recent_low = float(
 
-        return None
+        df.iloc[i - 8:i]["low"].min()
 
-    if atr <= 0:
+    )
 
-        return None
+    recent_high = float(
+
+        df.iloc[i - 8:i]["high"].max()
+
+    )
 
     if direction == "BUY":
 
-        sl = entry - (
+        sl = min(
 
-            SL_ATR * atr
+            recent_low - atr * SL_ATR_BUFFER,
 
-        )
-
-        tp1 = entry + (
-
-            TP1_ATR * atr
+            entry - atr * 1.2,
 
         )
 
-        tp2 = entry + (
+        risk = entry - sl
 
-            TP2_ATR * atr
+        tp1 = entry + risk
 
-        )
+        tp2 = entry + risk * 2
 
-        tp3 = entry + (
-
-            TP3_ATR * atr
-
-        )
+        tp3 = entry + risk * 3
 
     else:
 
-        sl = entry + (
+        sl = max(
 
-            SL_ATR * atr
+            recent_high + atr * SL_ATR_BUFFER,
 
-        )
-
-        tp1 = entry - (
-
-            TP1_ATR * atr
+            entry + atr * 1.2,
 
         )
 
-        tp2 = entry - (
+        risk = sl - entry
 
-            TP2_ATR * atr
+        tp1 = entry - risk
 
-        )
+        tp2 = entry - risk * 2
 
-        tp3 = entry - (
+        tp3 = entry - risk * 3
 
-            TP3_ATR * atr
+    if risk <= 0:
 
-        )
+        return None
 
     return {
 
         "direction": direction,
-
-        "signal_time": timestamp,
 
         "entry": entry,
 
@@ -1802,65 +1936,43 @@ def backtest_entry(
 
         "tp3": tp3,
 
-        "atr": atr,
+        "time": row["datetime"],
 
     }
 
-# ============================================================
-
-# CHECK TRADE
-
-# ============================================================
-
-def check_trade(
+def check_exit(
 
     df,
 
-    start_index,
+    start,
 
     trade,
 
 ):
 
-    """
-
-    Conservative rule:
-
-    If TP and SL are both touched in
-
-    the same candle, SL is assumed first.
-
-    Backtest result is based on TP1.
-
-    TP2/TP3 remain additional display targets.
-
-    """
-
-    direction = trade["direction"]
-
     for j in range(
 
-        start_index + 1,
+        start + 1,
 
         len(df),
 
     ):
 
-        candle = df.iloc[j]
+        row = df.iloc[j]
 
         high = float(
 
-            candle["high"]
+            row["high"]
 
         )
 
         low = float(
 
-            candle["low"]
+            row["low"]
 
         )
 
-        if direction == "BUY":
+        if trade["direction"] == "BUY":
 
             hit_sl = (
 
@@ -1888,113 +2000,183 @@ def check_trade(
 
             )
 
-        # Conservative same-candle handling.
+        # Conservative assumption.
 
         if hit_sl and hit_tp:
 
-            return {
+            return (
 
-                "result": "LOSS",
+                "LOSS",
 
-                "r": -1.0,
+                -1.0,
 
-                "exit_time": candle[
+                j,
 
-                    "datetime"
-
-                ],
-
-                "exit": trade["sl"],
-
-                "exit_index": j,
-
-            }
+            )
 
         if hit_sl:
 
-            return {
+            return (
 
-                "result": "LOSS",
+                "LOSS",
 
-                "r": -1.0,
+                -1.0,
 
-                "exit_time": candle[
+                j,
 
-                    "datetime"
-
-                ],
-
-                "exit": trade["sl"],
-
-                "exit_index": j,
-
-            }
+            )
 
         if hit_tp:
 
-            return {
+            return (
 
-                "result": "WIN",
+                "WIN",
 
-                "r": TP1_ATR / SL_ATR,
+                1.0,
 
-                "exit_time": candle[
+                j,
 
-                    "datetime"
+            )
 
-                ],
+    return (
 
-                "exit": trade["tp1"],
+        "OPEN",
 
-                "exit_index": j,
+        0.0,
 
-            }
-
-    return {
-
-        "result": "OPEN",
-
-        "r": 0.0,
-
-        "exit_time": None,
-
-        "exit": None,
-
-        "exit_index": len(df) - 1,
-
-    }
-
-# ============================================================
-
-# RUN BACKTEST FOR ONE SYMBOL
-
-# ============================================================
-
-def run_backtest_symbol(symbol):
-
-    data = prepare_backtest(
-
-        symbol
+        len(df) - 1,
 
     )
 
-    if data is None:
+# ============================================================
+
+# ONE SYMBOL BACKTEST
+
+# ============================================================
+
+def backtest_symbol(symbol):
+
+    df4 = historical_data(
+
+        symbol,
+
+        "4h",
+
+        90,
+
+    )
+
+    df1 = historical_data(
+
+        symbol,
+
+        "1h",
+
+        90,
+
+    )
+
+    df15 = historical_data(
+
+        symbol,
+
+        "15min",
+
+        90,
+
+    )
+
+    if (
+
+        df4 is None
+
+        or df1 is None
+
+        or df15 is None
+
+    ):
 
         return []
 
-    df15 = data["15m"]
+    df4 = indicators(df4)
+
+    df1 = indicators(df1)
+
+    df15 = indicators(df15)
+
+    if (
+
+        df4 is None
+
+        or df1 is None
+
+        or df15 is None
+
+    ):
+
+        return []
 
     trades = []
 
-    i = 2
+    i = 20
 
     while i < len(df15) - 1:
 
+        timestamp = df15.iloc[i][
+
+            "datetime"
+
+        ]
+
+        trend4 = backtest_trend(
+
+            df4,
+
+            timestamp,
+
+        )
+
+        trend1 = backtest_trend(
+
+            df1,
+
+            timestamp,
+
+        )
+
+        if (
+
+            trend4 == "WAIT"
+
+            or trend1 != trend4
+
+        ):
+
+            i += 1
+
+            continue
+
+        if not backtest_pullback(
+
+            df1,
+
+            timestamp,
+
+            trend4,
+
+        ):
+
+            i += 1
+
+            continue
+
         trade = backtest_entry(
 
-            data,
+            df15,
 
             i,
+
+            trend4,
 
         )
 
@@ -2004,83 +2186,61 @@ def run_backtest_symbol(symbol):
 
             continue
 
-        result = check_trade(
+        result, r, exit_index = (
 
-            df15,
+            check_exit(
 
-            i,
+                df15,
 
-            trade,
+                i,
+
+                trade,
+
+            )
 
         )
 
-        if result["result"] == "OPEN":
+        if result == "OPEN":
 
             break
 
-        trade.update(result)
+        trade["result"] = result
+
+        trade["r"] = r
 
         trades.append(trade)
 
-        # Don't open another trade
-
-        # while the previous one is active.
-
-        i = result["exit_index"] + 1
+        i = exit_index + 1
 
     return trades
 
 # ============================================================
 
-# STATISTICS
+# BACKTEST STATS
 
 # ============================================================
 
-def calculate_stats(trades):
-
-    if not trades:
-
-        return {
-
-            "total": 0,
-
-            "wins": 0,
-
-            "losses": 0,
-
-            "win_rate": 0.0,
-
-            "net_r": 0.0,
-
-            "max_dd": 0.0,
-
-            "max_loss_streak": 0,
-
-        }
+def stats(trades):
 
     wins = sum(
 
-        1
+        t["result"] == "WIN"
 
         for t in trades
-
-        if t["result"] == "WIN"
 
     )
 
     losses = sum(
 
-        1
+        t["result"] == "LOSS"
 
         for t in trades
-
-        if t["result"] == "LOSS"
 
     )
 
     total = wins + losses
 
-    win_rate = (
+    winrate = (
 
         wins / total * 100
 
@@ -2090,7 +2250,7 @@ def calculate_stats(trades):
 
     )
 
-    net_r = sum(
+    net = sum(
 
         t["r"]
 
@@ -2098,19 +2258,19 @@ def calculate_stats(trades):
 
     )
 
-    equity = 0.0
+    equity = 0
 
-    peak = 0.0
+    peak = 0
 
-    max_dd = 0.0
+    max_dd = 0
 
-    losing_streak = 0
+    losing = 0
 
-    max_loss_streak = 0
+    max_losing = 0
 
-    for trade in trades:
+    for t in trades:
 
-        equity += trade["r"]
+        equity += t["r"]
 
         peak = max(
 
@@ -2120,35 +2280,29 @@ def calculate_stats(trades):
 
         )
 
-        drawdown = (
-
-            peak - equity
-
-        )
-
         max_dd = max(
 
             max_dd,
 
-            drawdown,
+            peak - equity,
 
         )
 
-        if trade["result"] == "LOSS":
+        if t["result"] == "LOSS":
 
-            losing_streak += 1
+            losing += 1
 
-            max_loss_streak = max(
+            max_losing = max(
 
-                max_loss_streak,
+                max_losing,
 
-                losing_streak,
+                losing,
 
             )
 
         else:
 
-            losing_streak = 0
+            losing = 0
 
     return {
 
@@ -2158,81 +2312,59 @@ def calculate_stats(trades):
 
         "losses": losses,
 
-        "win_rate": win_rate,
+        "winrate": winrate,
 
-        "net_r": net_r,
+        "net": net,
 
-        "max_dd": max_dd,
+        "dd": max_dd,
 
-        "max_loss_streak": max_loss_streak,
+        "losing": max_losing,
 
     }
 
 # ============================================================
 
-# FULL 90-DAY BACKTEST
+# FULL BACKTEST
 
 # ============================================================
 
-def run_full_backtest():
+def run_backtest():
 
-    start_time = time.time()
+    start = time.time()
 
-    lines = [
+    all_trades = []
 
-        "📊 90-DAY BACKTEST",
+    text = [
 
-        "🧠 SAME LIVE STRATEGY",
-
-        "4H → 1H → 15M",
+        "📊 90-DAY PRO STRATEGY BACKTEST",
 
         "━━━━━━━━━━━━━━━━━━",
+
+        "4H TREND",
+
+        "1H PULLBACK",
+
+        "15M BOS ENTRY",
 
         "",
 
     ]
 
-    all_trades = []
-
-    successful_symbols = 0
-
     for symbol in SYMBOLS:
 
         name = SYMBOLS[symbol]["name"]
 
-        lines.append(
+        text.append(
 
             f"⏳ Testing {name}..."
 
         )
 
-        print(
-
-            f"Starting backtest: "
-
-            f"{symbol}"
-
-        )
-
         try:
 
-            trades = run_backtest_symbol(
+            trades = backtest_symbol(
 
                 symbol
-
-            )
-
-            if trades is None:
-
-                trades = []
-
-            if trades:
-
-                successful_symbols += 1
-
-            stats = calculate_stats(
-
-                trades
 
             )
 
@@ -2242,63 +2374,55 @@ def run_full_backtest():
 
             )
 
-            lines.append(
+            s = stats(trades)
 
-                f"Trades: {stats['total']}"
+            text.extend(
 
-            )
+                [
 
-            lines.append(
+                    f"Trades: {s['total']}",
 
-                f"Wins: {stats['wins']} | "
+                    f"Wins: {s['wins']}",
 
-                f"Losses: {stats['losses']}"
+                    f"Losses: {s['losses']}",
 
-            )
+                    f"Win rate: "
 
-            lines.append(
+                    f"{s['winrate']:.1f}%",
 
-                f"Win rate: "
+                    f"Net: "
 
-                f"{stats['win_rate']:.1f}%"
+                    f"{s['net']:+.2f}R",
 
-            )
+                    "",
 
-            lines.append(
-
-                f"Net: "
-
-                f"{stats['net_r']:+.2f}R"
+                ]
 
             )
-
-            lines.append("")
 
         except Exception as e:
 
             print(
 
-                f"SYMBOL BACKTEST ERROR "
+                f"BACKTEST ERROR "
 
                 f"{symbol}: {e}"
 
             )
 
-            lines.append(
+            text.extend(
 
-                "⚠️ DATA/TEST ERROR"
+                [
+
+                    "⚠️ DATA/TEST ERROR",
+
+                    "",
+
+                ]
 
             )
 
-            lines.append("")
-
-    # --------------------------------------------------------
-
-    # Overall
-
-    # --------------------------------------------------------
-
-    overall = calculate_stats(
+    overall = stats(
 
         all_trades
 
@@ -2306,13 +2430,11 @@ def run_full_backtest():
 
     elapsed = (
 
-        time.time()
-
-        - start_time
+        time.time() - start
 
     )
 
-    lines.extend(
+    text.extend(
 
         [
 
@@ -2336,29 +2458,27 @@ def run_full_backtest():
 
             f"Win rate: "
 
-            f"{overall['win_rate']:.1f}%",
+            f"{overall['winrate']:.1f}%",
 
             f"Net result: "
 
-            f"{overall['net_r']:+.2f}R",
+            f"{overall['net']:+.2f}R",
 
             f"Max drawdown: "
 
-            f"{overall['max_dd']:.2f}R",
+            f"{overall['dd']:.2f}R",
 
             f"Max losing streak: "
 
-            f"{overall['max_loss_streak']}",
+            f"{overall['losing']}",
 
             "",
 
-            f"⏱ Backtest time: "
-
-            f"{elapsed:.0f}s",
+            f"⏱ Time: {elapsed:.0f}s",
 
             "",
 
-            "📊 Data: Twelve Data",
+            "📡 Data: Twelve Data",
 
             "🏦 Broker: Lirunex MT5",
 
@@ -2366,39 +2486,19 @@ def run_full_backtest():
 
             "",
 
-            "⚠️ TP1 used as the backtest win target.",
+            "⚠️ TP1 = 1R backtest target.",
 
-            "⚠️ If TP and SL occur in the same candle,",
+            "⚠️ Same-candle TP/SL = LOSS.",
 
-            "   SL is counted first.",
+            "⚠️ Historical performance is not",
 
-            "⚠️ Historical results do not guarantee",
-
-            "   future performance.",
+            "a guarantee of future results.",
 
         ]
 
     )
 
-    if successful_symbols == 0:
-
-        lines.extend(
-
-            [
-
-                "",
-
-                "❗ No valid symbol produced a backtest.",
-
-                "Check Render logs for the exact",
-
-                "Twelve Data API error.",
-
-            ]
-
-        )
-
-    return "\n".join(lines)
+    return "\n".join(text)
 
 # ============================================================
 
@@ -2406,7 +2506,7 @@ def run_full_backtest():
 
 # ============================================================
 
-async def start_command(
+async def start(
 
     update: Update,
 
@@ -2414,53 +2514,39 @@ async def start_command(
 
 ):
 
-    text = (
+    await update.message.reply_text(
 
-        "🟢 ADIL PRO MARKET MOOD\n\n"
+        "🟢 ADIL PRO TREND PULLBACK BOT\n\n"
 
-        "Bot is online.\n\n"
+        "4H → Trend\n"
 
-        "📊 Fresh market check:\n"
+        "1H → Pullback\n"
 
-        "Type: market\n"
-
-        "or: mood\n"
-
-        "or: signal\n\n"
+        "15M → BOS Entry\n\n"
 
         "Pairs:\n"
 
-        "🥇 GOLD (XAUUSD.r)\n"
+        "🥇 GOLD\n"
 
-        "💱 EURUSD.r\n"
+        "💱 EURUSD\n"
 
-        "₿ BTCUSD.r\n\n"
+        "₿ BTC\n\n"
 
-        "Timeframes:\n"
+        "Commands:\n"
 
-        "15M / 1H / 4H\n\n"
+        "/market\n"
 
-        "/start - Bot status\n"
+        "/signal\n"
 
-        "/status - System status\n"
+        "/backtest\n"
 
-        "/test - Telegram test\n"
+        "/status\n"
 
-        "/market - Market report\n"
-
-        "/signal - Confirmed signals\n"
-
-        "/backtest - 90-day backtest"
+        "/test"
 
     )
 
-    await update.message.reply_text(
-
-        text
-
-    )
-
-async def status_command(
+async def status(
 
     update: Update,
 
@@ -2472,25 +2558,29 @@ async def status_command(
 
         "🟢 BOT ONLINE\n\n"
 
-        "Strategy: 4H → 1H → 15M\n"
+        "Strategy: Trend + Pullback + BOS\n"
 
-        "Risk model: ATR\n"
+        "4H: Trend\n"
 
-        "SL: 1.2 ATR\n"
+        "1H: Pullback\n"
 
-        "TP1: 1.5 ATR\n"
+        "15M: Entry\n\n"
 
-        "TP2: 2.5 ATR\n"
+        "SL: Structure + ATR\n"
 
-        "TP3: 3.5 ATR\n\n"
+        "TP1: 1R\n"
 
-        "Scanner: every 5 minutes\n"
+        "TP2: 2R\n"
+
+        "TP3: 3R\n\n"
+
+        "Scanner: 5 minutes\n"
 
         "Execution: Manual MT5"
 
     )
 
-async def test_command(
+async def test(
 
     update: Update,
 
@@ -2500,13 +2590,11 @@ async def test_command(
 
     await update.message.reply_text(
 
-        "✅ Telegram test successful.\n"
-
-        "Bot communication is working."
+        "✅ Telegram connection working."
 
     )
 
-async def market_command(
+async def market(
 
     update: Update,
 
@@ -2516,19 +2604,17 @@ async def market_command(
 
     await update.message.reply_text(
 
-        "⏳ Checking market..."
+        "⏳ Checking..."
 
     )
-
-    report = market_report()
 
     await update.message.reply_text(
 
-        report
+        market_report()
 
     )
 
-async def signal_command(
+async def signal(
 
     update: Update,
 
@@ -2538,7 +2624,7 @@ async def signal_command(
 
     await update.message.reply_text(
 
-        "⏳ Checking confirmed signals..."
+        "⏳ Searching confirmed setups..."
 
     )
 
@@ -2546,11 +2632,7 @@ async def signal_command(
 
     for symbol in SYMBOLS:
 
-        result = analyze_symbol(
-
-            symbol
-
-        )
+        result = analyze(symbol)
 
         if result.get(
 
@@ -2564,39 +2646,37 @@ async def signal_command(
 
         ]:
 
-            message = signal_message(
+            await update.message.reply_text(
 
-                symbol,
+                signal_message(
 
-                result,
+                    symbol,
 
-            )
-
-            if message:
-
-                await update.message.reply_text(
-
-                    message
+                    result,
 
                 )
 
-                found += 1
+            )
 
-        time.sleep(2)
+            found += 1
+
+        time.sleep(1)
 
     if found == 0:
 
         await update.message.reply_text(
 
-            "⚪ No confirmed signal right now.\n\n"
+            "⚪ No confirmed setup right now.\n\n"
 
-            "4H → 1H → 15M confirmation "
+            "The bot is waiting for:\n"
 
-            "is not complete."
+            "4H trend → 1H pullback → "
+
+            "15M BOS."
 
         )
 
-async def backtest_command(
+async def backtest(
 
     update: Update,
 
@@ -2606,31 +2686,21 @@ async def backtest_command(
 
     await update.message.reply_text(
 
-        "⏳ 90-day backtest started.\n"
+        "⏳ 90-day backtest starting...\n"
 
-        "This may take a few minutes because "
+        "Historical data is being downloaded "
 
-        "historical data is downloaded in chunks."
+        "in safe chunks."
 
     )
 
     try:
 
-        result = run_full_backtest()
-
-        # Telegram has message-size limits.
-
-        if len(result) > 3900:
-
-            result = result[
-
-                :3900
-
-            ]
+        result = run_backtest()
 
         await update.message.reply_text(
 
-            result
+            result[:3900]
 
         )
 
@@ -2646,17 +2716,9 @@ async def backtest_command(
 
         await update.message.reply_text(
 
-            "❌ Backtest error.\n\n"
-
-            f"{str(e)[:1000]}"
+            f"❌ Backtest error:\n{str(e)[:1000]}"
 
         )
-
-# ============================================================
-
-# TEXT COMMANDS
-
-# ============================================================
 
 async def text_handler(
 
@@ -2688,7 +2750,7 @@ async def text_handler(
 
     ]:
 
-        await market_command(
+        await market(
 
             update,
 
@@ -2698,7 +2760,7 @@ async def text_handler(
 
     elif text == "signal":
 
-        await signal_command(
+        await signal(
 
             update,
 
@@ -2708,7 +2770,7 @@ async def text_handler(
 
     elif text == "backtest":
 
-        await backtest_command(
+        await backtest(
 
             update,
 
@@ -2718,7 +2780,7 @@ async def text_handler(
 
     elif text == "status":
 
-        await status_command(
+        await status(
 
             update,
 
@@ -2728,17 +2790,11 @@ async def text_handler(
 
 # ============================================================
 
-# TELEGRAM APP
+# TELEGRAM LOOP
 
 # ============================================================
 
 def telegram_loop():
-
-    print(
-
-        "Starting Telegram bot..."
-
-    )
 
     application = (
 
@@ -2756,7 +2812,7 @@ def telegram_loop():
 
             "start",
 
-            start_command,
+            start,
 
         )
 
@@ -2768,7 +2824,7 @@ def telegram_loop():
 
             "status",
 
-            status_command,
+            status,
 
         )
 
@@ -2780,7 +2836,7 @@ def telegram_loop():
 
             "test",
 
-            test_command,
+            test,
 
         )
 
@@ -2792,7 +2848,7 @@ def telegram_loop():
 
             "market",
 
-            market_command,
+            market,
 
         )
 
@@ -2804,7 +2860,7 @@ def telegram_loop():
 
             "signal",
 
-            signal_command,
+            signal,
 
         )
 
@@ -2816,7 +2872,7 @@ def telegram_loop():
 
             "backtest",
 
-            backtest_command,
+            backtest,
 
         )
 
@@ -2838,7 +2894,7 @@ def telegram_loop():
 
     print(
 
-        "Telegram polling started."
+        "Telegram bot started."
 
     )
 
@@ -2858,29 +2914,21 @@ if __name__ == "__main__":
 
     print(
 
-        "================================"
+        "===================================="
 
     )
 
     print(
 
-        "ADIL PRO MARKET MOOD v14"
+        "ADIL PRO TREND PULLBACK BOT"
 
     )
 
     print(
 
-        "Starting..."
+        "===================================="
 
     )
-
-    print(
-
-        "================================"
-
-    )
-
-    # Flask
 
     threading.Thread(
 
@@ -2890,8 +2938,6 @@ if __name__ == "__main__":
 
     ).start()
 
-    # Scanner
-
     threading.Thread(
 
         target=scanner_loop,
@@ -2899,7 +2945,5 @@ if __name__ == "__main__":
         daemon=True,
 
     ).start()
-
-    # Telegram
 
     telegram_loop()
