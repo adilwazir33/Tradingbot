@@ -8,11 +8,7 @@ import numpy as np
 import pandas as pd
 from flask import Flask
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 # =========================================================
 # CONFIG
 # =========================================================
@@ -39,7 +35,6 @@ TIMEFRAMES = {
     "1H": "1h",
     "15M": "15min",
 }
-# Strategy
 EMA_FAST = 21
 EMA_MID = 50
 EMA_SLOW = 200
@@ -49,9 +44,6 @@ SL_ATR = 1.2
 TP1_ATR = 1.5
 TP2_ATR = 2.5
 TP3_ATR = 3.5
-# Sideways threshold
-EMA_SIDEWAYS_PCT = 0.05
-PRICE_EMA200_SIDEWAYS_PCT = 0.10
 DUBAI_TZ = ZoneInfo("Asia/Dubai")
 # =========================================================
 # FLASK
@@ -69,46 +61,6 @@ def run_flask():
 # =========================================================
 # TELEGRAM
 # =========================================================
-telegram_app = None
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "🟢 ADIL PRO FIXED\n\n"
-        "Bot is online and scanning.\n\n"
-        "✅ Telegram\n"
-        "✅ Twelve Data\n"
-        "✅ 4H\n"
-        "✅ 1H\n"
-        "✅ 15M\n\n"
-        "Pairs:\n"
-        "🟡 GOLD (XAUUSD.r)\n"
-        "💱 EURUSD.r\n"
-        "₿ BTCUSD.r\n\n"
-        "Commands:\n"
-        "/start - bot status\n"
-        "/status - system status\n"
-        "/test - Telegram test"
-    )
-    await update.message.reply_text(msg)
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    api_status = "✅ FOUND" if TWELVE_API_KEY else "❌ MISSING"
-    chat_status = "✅ CONFIGURED" if CHAT_ID else "❌ MISSING"
-    msg = (
-        "📊 ADIL PRO FIXED STATUS\n\n"
-        f"Twelve Data API: {api_status}\n"
-        f"Telegram Chat ID: {chat_status}\n"
-        "Timeframes: 4H / 1H / 15M\n"
-        "Pairs: GOLD / EURUSD.r / BTCUSD.r\n"
-        "Scan: Every 5 minutes\n"
-        "Execution: Manual MT5\n"
-        "Broker: Lirunex MT5\n"
-        "Data: Twelve Data public feed"
-    )
-    await update.message.reply_text(msg)
-async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🟢 ADIL PRO FIXED TEST OK\n"
-        "Telegram connection is working."
-    )
 def send_telegram(message):
     if not TOKEN or not CHAT_ID:
         print("Telegram configuration missing")
@@ -131,12 +83,81 @@ def send_telegram(message):
     except Exception as e:
         print("Telegram exception:", e)
         return False
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🟢 ADIL PRO FIXED\n\n"
+        "Bot is online and scanning.\n\n"
+        "✅ Telegram\n"
+        "✅ Twelve Data\n"
+        "✅ 4H\n"
+        "✅ 1H\n"
+        "✅ 15M\n\n"
+        "Pairs:\n"
+        "🟡 GOLD (XAUUSD.r)\n"
+        "💱 EURUSD.r\n"
+        "₿ BTCUSD.r\n\n"
+        "/start - bot status\n"
+        "/status - system status\n"
+        "/test - Telegram test"
+    )
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📊 ADIL PRO FIXED STATUS\n\n"
+        f"Twelve Data: "
+        f"{'✅ OK' if TWELVE_API_KEY else '❌ MISSING'}\n"
+        f"Telegram: "
+        f"{'✅ OK' if CHAT_ID else '❌ MISSING'}\n"
+        "Timeframes: 4H / 1H / 15M\n"
+        "Pairs: GOLD / EURUSD.r / BTCUSD.r\n"
+        "Scan: Every 5 minutes\n"
+        "Broker: Lirunex MT5\n"
+        "Execution: Manual"
+    )
+async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🟢 ADIL PRO FIXED TEST OK"
+    )
+def start_telegram():
+    if not TOKEN:
+        print("BOT_TOKEN missing")
+        return
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .build()
+    )
+    app.add_handler(
+        CommandHandler("start", start_command)
+    )
+    app.add_handler(
+        CommandHandler("status", status_command)
+    )
+    app.add_handler(
+        CommandHandler("test", test_command)
+    )
+    print("Telegram polling started")
+    send_telegram(
+        "🟢 ADIL PRO FIXED\n"
+        "Bot is LIVE.\n\n"
+        "✅ Telegram\n"
+        "✅ Twelve Data\n"
+        "✅ 4H\n"
+        "✅ 1H\n"
+        "✅ 15M\n"
+        "✅ GOLD\n"
+        "✅ EURUSD.r\n"
+        "✅ BTCUSD.r\n\n"
+        "📊 Scan every 5 minutes."
+    )
+    app.run_polling(
+        drop_pending_updates=True
+    )
 # =========================================================
 # TWELVE DATA
 # =========================================================
 def get_candles(symbol, interval, outputsize=260):
     if not TWELVE_API_KEY:
-        print("Twelve Data API key missing")
+        print("TWELVE_DATA_API_KEY missing")
         return None
     url = "https://api.twelvedata.com/time_series"
     params = {
@@ -150,39 +171,54 @@ def get_candles(symbol, interval, outputsize=260):
         r = requests.get(
             url,
             params=params,
-            timeout=30,
+            timeout=30
         )
         data = r.json()
         if "values" not in data:
             print(
-                f"Twelve Data error for {symbol} {interval}:",
+                "Twelve Data error:",
+                symbol,
+                interval,
                 data
             )
             return None
         df = pd.DataFrame(data["values"])
         if df.empty:
             return None
-        # Numeric conversion
-        for col in ["open", "high", "low", "close", "volume"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(
-                    df[col],
+        for column in [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        ]:
+            if column in df.columns:
+                df[column] = pd.to_numeric(
+                    df[column],
                     errors="coerce"
                 )
         df["datetime"] = pd.to_datetime(
             df["datetime"],
             errors="coerce"
         )
-        df = df.sort_values("datetime").reset_index(drop=True)
-        # Remove invalid rows
+        df = df.sort_values(
+            "datetime"
+        ).reset_index(drop=True)
         df = df.dropna(
-            subset=["open", "high", "low", "close"]
+            subset=[
+                "open",
+                "high",
+                "low",
+                "close"
+            ]
         ).reset_index(drop=True)
         return df
     except Exception as e:
         print(
-            f"Candle request exception "
-            f"{symbol} {interval}: {e}"
+            "Twelve Data exception:",
+            symbol,
+            interval,
+            e
         )
         return None
 # =========================================================
@@ -194,17 +230,19 @@ def calculate_rsi(close, period=14):
     loss = -delta.clip(upper=0)
     avg_gain = gain.ewm(
         alpha=1 / period,
-        min_periods=period,
         adjust=False
     ).mean()
     avg_loss = loss.ewm(
         alpha=1 / period,
-        min_periods=period,
         adjust=False
     ).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+    rs = avg_gain / avg_loss.replace(
+        0,
+        np.nan
+    )
+    return 100 - (
+        100 / (1 + rs)
+    )
 def add_indicators(df):
     df = df.copy()
     close = df["close"]
@@ -224,10 +262,14 @@ def add_indicators(df):
         close,
         RSI_PERIOD
     )
-    prev_close = close.shift(1)
+    previous_close = close.shift(1)
     tr1 = df["high"] - df["low"]
-    tr2 = (df["high"] - prev_close).abs()
-    tr3 = (df["low"] - prev_close).abs()
+    tr2 = (
+        df["high"] - previous_close
+    ).abs()
+    tr3 = (
+        df["low"] - previous_close
+    ).abs()
     true_range = pd.concat(
         [tr1, tr2, tr3],
         axis=1
@@ -235,26 +277,29 @@ def add_indicators(df):
     df["atr"] = true_range.rolling(
         ATR_PERIOD
     ).mean()
-    # Momentum
-    df["momentum"] = close.pct_change(5) * 100
-    # Volume if available
+    df["momentum"] = (
+        close.pct_change(5) * 100
+    )
     if "volume" in df.columns:
-        df["volume_ma"] = df["volume"].rolling(20).mean()
+        df["volume_ma"] = (
+            df["volume"].rolling(20).mean()
+        )
     return df
 # =========================================================
-# PRICE FORMATTING
+# PRICE FORMAT
 # =========================================================
-def decimals_for(symbol, price):
-    if symbol == "BTCUSD.r":
-        return 2
-    if symbol == "XAUUSD.r":
-        return 2
-    return 5
-def fmt_price(symbol, price):
-    if price is None or not np.isfinite(price):
+def format_price(symbol, value):
+    if value is None:
         return "N/A"
-    decimals = decimals_for(symbol, price)
-    return f"{price:.{decimals}f}"
+    try:
+        value = float(value)
+    except Exception:
+        return "N/A"
+    if not np.isfinite(value):
+        return "N/A"
+    if symbol == "EURUSD.r":
+        return f"{value:.5f}"
+    return f"{value:.2f}"
 # =========================================================
 # MARKET ANALYSIS
 # =========================================================
@@ -262,19 +307,25 @@ def analyze_market(df, symbol):
     if df is None or len(df) < 220:
         return {
             "status": "DATA ERROR",
-            "side": None,
-            "strength": 0,
             "price": None,
+            "strength": 0,
         }
     df = add_indicators(df)
     row = df.iloc[-1]
-    price = float(row["close"])
-    ema21 = float(row["ema21"])
-    ema50 = float(row["ema50"])
-    ema200 = float(row["ema200"])
-    rsi = float(row["rsi"])
-    atr = float(row["atr"])
-    momentum = float(row["momentum"])
+    try:
+        price = float(row["close"])
+        ema21 = float(row["ema21"])
+        ema50 = float(row["ema50"])
+        ema200 = float(row["ema200"])
+        rsi = float(row["rsi"])
+        atr = float(row["atr"])
+        momentum = float(row["momentum"])
+    except Exception:
+        return {
+            "status": "DATA ERROR",
+            "price": None,
+            "strength": 0,
+        }
     if not all(
         np.isfinite(x)
         for x in [
@@ -289,13 +340,9 @@ def analyze_market(df, symbol):
     ):
         return {
             "status": "DATA ERROR",
-            "side": None,
-            "strength": 0,
             "price": price,
+            "strength": 0,
         }
-    # -----------------------------------------------------
-    # BUY SCORE
-    # -----------------------------------------------------
     buy_score = 0
     sell_score = 0
     # EMA 21 / 50
@@ -320,8 +367,8 @@ def analyze_market(df, symbol):
         sell_score += 1
     # Volume
     if "volume" in df.columns:
-        volume = row["volume"]
-        volume_ma = row["volume_ma"]
+        volume = row.get("volume")
+        volume_ma = row.get("volume_ma")
         if (
             pd.notna(volume)
             and pd.notna(volume_ma)
@@ -332,39 +379,37 @@ def analyze_market(df, symbol):
                 buy_score += 1
             else:
                 sell_score += 1
-    max_score = 7
-    # -----------------------------------------------------
-    # SIDEWAYS DETECTION
-    # -----------------------------------------------------
-    ema_spread_pct = (
-        abs(ema21 - ema50) / price
-    ) * 100
-    price_ema200_pct = (
-        abs(price - ema200) / price
-    ) * 100
-    sideways = (
-        ema_spread_pct < EMA_SIDEWAYS_PCT
-        and price_ema200_pct < PRICE_EMA200_SIDEWAYS_PCT
+    score = max(
+        buy_score,
+        sell_score
     )
-    # -----------------------------------------------------
-    # DIRECTION
-    # -----------------------------------------------------
+    # Direction
     if buy_score > sell_score:
         side = "BUY"
-        score = buy_score
     elif sell_score > buy_score:
         side = "SELL"
-        score = sell_score
     else:
-        # Tie breaker
-        if price >= ema21:
-            side = "BUY"
-        else:
-            side = "SELL"
-        score = max(buy_score, sell_score)
-    # -----------------------------------------------------
-    # STRENGTH
-    # -----------------------------------------------------
+        side = (
+            "BUY"
+            if price >= ema21
+            else "SELL"
+        )
+    # Sideways
+    ema_spread_pct = (
+        abs(ema21 - ema50)
+        / price
+        * 100
+    )
+    price_ema200_pct = (
+        abs(price - ema200)
+        / price
+        * 100
+    )
+    sideways = (
+        ema_spread_pct < 0.05
+        and price_ema200_pct < 0.10
+    )
+    # Strength
     strength_map = {
         0: 0,
         1: 1,
@@ -375,10 +420,11 @@ def analyze_market(df, symbol):
         6: 9,
         7: 10,
     }
-    strength = strength_map.get(score, 0)
-    # -----------------------------------------------------
-    # STATUS
-    # -----------------------------------------------------
+    strength = strength_map.get(
+        score,
+        0
+    )
+    # Status
     if sideways or score <= 2:
         status = "WAIT"
     elif score >= 6:
@@ -387,20 +433,34 @@ def analyze_market(df, symbol):
         status = side
     else:
         status = f"{side} WEAK"
-    # -----------------------------------------------------
-    # ENTRY / SL / TPS
-    # -----------------------------------------------------
+    # Entry / SL / TP
     entry = price
     if side == "BUY":
-        sl = entry - (SL_ATR * atr)
-        tp1 = entry + (TP1_ATR * atr)
-        tp2 = entry + (TP2_ATR * atr)
-        tp3 = entry + (TP3_ATR * atr)
+        sl = entry - (
+            SL_ATR * atr
+        )
+        tp1 = entry + (
+            TP1_ATR * atr
+        )
+        tp2 = entry + (
+            TP2_ATR * atr
+        )
+        tp3 = entry + (
+            TP3_ATR * atr
+        )
     else:
-        sl = entry + (SL_ATR * atr)
-        tp1 = entry - (TP1_ATR * atr)
-        tp2 = entry - (TP2_ATR * atr)
-        tp3 = entry - (TP3_ATR * atr)
+        sl = entry + (
+            SL_ATR * atr
+        )
+        tp1 = entry - (
+            TP1_ATR * atr
+        )
+        tp2 = entry - (
+            TP2_ATR * atr
+        )
+        tp3 = entry - (
+            TP3_ATR * atr
+        )
     return {
         "status": status,
         "side": side,
@@ -412,144 +472,158 @@ def analyze_market(df, symbol):
         "tp1": tp1,
         "tp2": tp2,
         "tp3": tp3,
-        "atr": atr,
-        "rsi": rsi,
-        "momentum": momentum,
-        "ema_spread_pct": ema_spread_pct,
-        "price_ema200_pct": price_ema200_pct,
-        "sideways": sideways,
+        "sideways_pct": ema_spread_pct,
     }
 # =========================================================
-# SIGNAL TEXT
+# RESULT FORMAT
 # =========================================================
-def pair_header(symbol, result):
-    name = SYMBOLS[symbol]["name"]
-    if result["status"] == "WAIT":
-        return f"⏳ {name} ({symbol}) — WAIT"
-    if result["status"].startswith("BUY"):
-        return f"🟢 {name} ({symbol}) — {result['status']}"
-    if result["status"].startswith("SELL"):
-        return f"🔴 {name} ({symbol}) — {result['status']}"
-    return f"⚪ {name} ({symbol}) — {result['status']}"
 def format_result(symbol, result):
-    header = pair_header(symbol, result)
-    price = fmt_price(
+    name = SYMBOLS[symbol]["name"]
+    status = result.get(
+        "status",
+        "DATA ERROR"
+    )
+    price = format_price(
         symbol,
         result.get("price")
     )
-    # Data error
-    if result["status"] == "DATA ERROR":
-        return (
-            f"⚠️ {header}\n"
-            f"Price: {price}\n"
-            f"Data unavailable"
-        )
-    # WAIT / sideways
-    if result["status"] == "WAIT":
+    if status == "WAIT":
         sideways_pct = result.get(
-            "ema_spread_pct",
+            "sideways_pct",
             0
         )
         return (
-            f"{header}\n"
+            f"⏳ {name} ({symbol}) — WAIT\n"
             f"Price: {price}\n"
             f"Sideways {sideways_pct:.3f}%\n"
-            f"Strength: {result['strength']}/10"
+            f"Strength: "
+            f"{result.get('strength', 0)}/10"
         )
+    if status == "DATA ERROR":
+        return (
+            f"⚠️ {name} ({symbol}) — DATA ERROR\n"
+            f"Price: {price}"
+        )
+    if status.startswith("BUY"):
+        icon = "🟢"
+    elif status.startswith("SELL"):
+        icon = "🔴"
+    else:
+        icon = "⚪"
     return (
-        f"{header}\n"
+        f"{icon} {name} ({symbol}) — {status}\n"
         f"Price: {price}\n"
-        f"Entry: {fmt_price(symbol, result['entry'])}\n"
-        f"SL: {fmt_price(symbol, result['sl'])}\n"
-        f"TP1: {fmt_price(symbol, result['tp1'])}\n"
-        f"TP2: {fmt_price(symbol, result['tp2'])}\n"
-        f"TP3: {fmt_price(symbol, result['tp3'])}\n"
-        f"Strength: {result['strength']}/10"
+        f"Entry: "
+        f"{format_price(symbol, result['entry'])}\n"
+        f"SL: "
+        f"{format_price(symbol, result['sl'])}\n"
+        f"TP1: "
+        f"{format_price(symbol, result['tp1'])}\n"
+        f"TP2: "
+        f"{format_price(symbol, result['tp2'])}\n"
+        f"TP3: "
+        f"{format_price(symbol, result['tp3'])}\n"
+        f"Strength: "
+        f"{result['strength']}/10"
     )
 # =========================================================
 # SCAN
 # =========================================================
-def scan_all_markets():
-    results = {}
-    for tf_name, td_interval in TIMEFRAMES.items():
-        results[tf_name] = {}
+def scan_markets():
+    all_results = {}
+    for timeframe, interval in TIMEFRAMES.items():
+        print(
+            f"===== SCANNING {timeframe} ====="
+        )
+        all_results[timeframe] = {}
         for symbol, info in SYMBOLS.items():
             print(
-                f"Scanning {symbol} "
-                f"{tf_name}..."
+                f"Fetching {symbol} "
+                f"{timeframe}"
             )
             df = get_candles(
                 info["td_symbol"],
-                td_interval,
-                outputsize=260
+                interval,
+                260
             )
             result = analyze_market(
                 df,
                 symbol
             )
-            results[tf_name][symbol] = result
-            # Small delay to reduce API burst/rate-limit risk
+            all_results[
+                timeframe
+            ][symbol] = result
+            # Prevent API burst
             time.sleep(3)
-    return results
+    return all_results
 # =========================================================
-# MESSAGE BUILDER
+# TELEGRAM MESSAGE
 # =========================================================
 def build_message(results):
-    now = datetime.now(DUBAI_TZ)
+    now = datetime.now(
+        DUBAI_TZ
+    )
     timestamp = now.strftime(
         "%d-%m %I:%M %p"
     )
-    lines = [
-        "💰 ADIL PRO FIXED",
-        f"🕐 {timestamp} Dubai",
-        "",
-        "📊 Data: Twelve Data public feed",
-        "🏦 Broker: Lirunex MT5",
-        "⚙️ Execution: Manual",
-        "⚠️ Public feed price may differ from Lirunex MT5",
-        "",
-    ]
-    for tf_name in ["4H", "1H", "15M"]:
-        lines.append(
-            f"===== {tf_name} ====="
+    message = (
+        "💰 ADIL PRO FIXED\n"
+        f"🕐 {timestamp} Dubai\n\n"
+        "📊 Data: Twelve Data public feed\n"
+        "🏦 Broker: Lirunex MT5\n"
+        "⚙️ Execution: Manual\n"
+        "⚠️ Public feed price may differ "
+        "from Lirunex MT5\n\n"
+    )
+    for timeframe in [
+        "4H",
+        "1H",
+        "15M"
+    ]:
+        message += (
+            f"===== {timeframe} =====\n"
         )
         for symbol in SYMBOLS:
             result = results.get(
-                tf_name,
+                timeframe,
                 {}
             ).get(
-                symbol
-            )
-            if result is None:
-                result = {
+                symbol,
+                {
                     "status": "DATA ERROR",
                     "price": None,
                     "strength": 0,
                 }
-            lines.append(
+            )
+            message += (
                 format_result(
                     symbol,
                     result
                 )
+                + "\n\n"
             )
-            lines.append("")
-    lines.extend([
-        "━━━━━━━━━━━━━━",
-        "⚠️ Signal = technical analysis only",
-        "No profit guarantee.",
-        "Use Lirunex MT5 for actual execution."
-    ])
-    return "\n".join(lines)
+    message += (
+        "━━━━━━━━━━━━━━\n"
+        "⚠️ Technical signal only.\n"
+        "No profit guarantee."
+    )
+    return message
 # =========================================================
 # BACKGROUND SCANNER
 # =========================================================
 def scanner_loop():
-    print("ADIL PRO FIXED SCANNER STARTED")
+    print(
+        "ADIL PRO FIXED SCANNER STARTED"
+    )
     while True:
         try:
-            print("Starting market scan...")
-            results = scan_all_markets()
-            message = build_message(results)
+            print(
+                "Starting new market scan..."
+            )
+            results = scan_markets()
+            message = build_message(
+                results
+            )
             print(message)
             send_telegram(message)
         except Exception as e:
@@ -558,68 +632,19 @@ def scanner_loop():
                 repr(e)
             )
         print(
-            f"Waiting {SCAN_INTERVAL} seconds..."
+            f"Next scan in "
+            f"{SCAN_INTERVAL} seconds"
         )
-        time.sleep(SCAN_INTERVAL)
-# =========================================================
-# TELEGRAM STARTUP
-# =========================================================
-def start_telegram():
-    global telegram_app
-    if not TOKEN:
-        print("BOT_TOKEN missing")
-        return
-    if not CHAT_ID:
-        print("CHAT_ID missing")
-        return
-    telegram_app = (
-        Application.builder()
-        .token(TOKEN)
-        .build()
-    )
-    telegram_app.add_handler(
-        CommandHandler(
-            "start",
-            start_command
+        time.sleep(
+            SCAN_INTERVAL
         )
-    )
-    telegram_app.add_handler(
-        CommandHandler(
-            "status",
-            status_command
-        )
-    )
-    telegram_app.add_handler(
-        CommandHandler(
-            "test",
-            test_command
-        )
-    )
-    print("Telegram bot starting...")
-    # Send startup message
-    send_telegram(
-        "🟢 ADIL PRO FIXED\n"
-        "Bot is LIVE.\n\n"
-        "✅ Telegram\n"
-        "✅ Twelve Data\n"
-        "✅ 4H\n"
-        "✅ 1H\n"
-        "✅ 15M\n"
-        "✅ GOLD\n"
-        "✅ EURUSD.r\n"
-        "✅ BTCUSD.r\n\n"
-        "📊 Scanning every 5 minutes."
-    )
-    telegram_app.run_polling(
-        drop_pending_updates=True
-    )
 # =========================================================
 # MAIN
 # =========================================================
 if __name__ == "__main__":
-    print("================================")
+    print("==============================")
     print("ADIL PRO FIXED")
-    print("================================")
+    print("==============================")
     print(
         "Symbols:",
         list(SYMBOLS.keys())
@@ -631,26 +656,22 @@ if __name__ == "__main__":
         else "API KEY MISSING"
     )
     print(
-        "Telegram Chat ID:",
+        "Telegram:",
         "CONFIGURED"
         if CHAT_ID
-        else "MISSING"
+        else "CHAT ID MISSING"
     )
-    # Flask in background
+    # Flask
     flask_thread = threading.Thread(
         target=run_flask,
         daemon=True
     )
     flask_thread.start()
-    # Scanner in background
+    # Scanner
     scanner_thread = threading.Thread(
         target=scanner_loop,
         daemon=True
     )
     scanner_thread.start()
-    # Telegram polling in main thread
+    # Telegram
     start_telegram()
-
-Is code mein hard-coded BTC/GOLD/EURUSD price nahi hai — har scan Twelve Data se candles leta hai aur usi actual returned price par calculation karta hai.
-
-Ek important point: 9 candle requests har 5 minutes hain (3 pairs × 3 timeframes), isliye code requests ke darmiyan delay rakhta hai taake Twelve Data rate-limit ka chance kam ho. Render par purana main.py replace karke redeploy kar dena.
