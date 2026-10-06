@@ -17,7 +17,6 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ✅ FIXED IMPORT
 from pyquotex.stable_api import Quotex
 
 # =========================================================
@@ -34,15 +33,10 @@ VERSION = "v13"
 PERIOD = 60
 CANDLE_COUNT = 120
 SCAN_DELAY = 5
-ENTRY_WINDOW_SECONDS = 3   # signal sirf fresh candle ke pehle 3 sec mein
+ENTRY_WINDOW_SECONDS = 3
 
-# Do not send duplicate signal for same asset/candle
 signal_memory = {}
-
-# Resolved symbol cache
 resolved_symbols = {}
-
-# Pending outcomes
 pending_outcomes = []
 pending_lock = threading.Lock()
 
@@ -75,30 +69,15 @@ def health():
 # ASSETS
 # =========================================================
 ASSETS = {
-    "EURUSD": [
-        "EURUSD",
-        "EURUSD_otc",
-        "EURUSD-OTC",
-    ],
-    "BTCUSD": [
-        "BTCUSD",
-        "BTCUSD_otc",
-        "BTCUSD-OTC",
-    ],
-    "XAUUSD": [
-        "XAUUSD",
-        "GOLD",
-        "XAUUSD_otc",
-        "GOLD_otc",
-        "GOLD-OTC",
-    ],
+    "EURUSD": ["EURUSD", "EURUSD_otc", "EURUSD-OTC"],
+    "BTCUSD": ["BTCUSD", "BTCUSD_otc", "BTCUSD-OTC"],
+    "XAUUSD": ["XAUUSD", "GOLD", "XAUUSD_otc", "GOLD_otc", "GOLD-OTC"],
 }
 
 # =========================================================
 # HELPERS
 # =========================================================
 def prune_signal_memory(max_age=3600):
-    """Purani signal memory entries delete karo."""
     cutoff = int(time.time()) - max_age
     for key in list(signal_memory.keys()):
         try:
@@ -291,7 +270,7 @@ def db_stats():
         return (0, 0, 0, 0, 0)
 
 # =========================================================
-# TELEGRAM RAW API
+# TELEGRAM
 # =========================================================
 def telegram_api(method, payload=None):
     if not BOT_TOKEN:
@@ -344,8 +323,7 @@ def verify_telegram():
     print(f"Telegram: token verified @{telegram_bot_username}")
 
     if not CHAT_ID:
-        print("WARNING: CHAT_ID is missing. Bot commands can still work, "
-              "but automatic signals cannot be sent.")
+        print("WARNING: CHAT_ID missing")
     return True
 
 # =========================================================
@@ -357,10 +335,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Version: <b>{VERSION}</b>\n"
         "Engine: <b>1 Minute</b>\n"
         "Markets: <b>BTC + EURUSD + GOLD + OTC</b>\n\n"
-        "Commands:\n"
-        "/status\n"
-        "/market\n"
-        "/stats"
+        "Commands:\n/status\n/market\n/stats"
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
@@ -377,9 +352,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "📈 <b>MARKETS</b>\n\n"
-        "🪙 BTCUSD\n"
-        "💱 EURUSD\n"
-        "🥇 XAUUSD / GOLD\n\n"
+        "🪙 BTCUSD\n💱 EURUSD\n🥇 XAUUSD / GOLD\n\n"
         "OTC symbols bhi scanner mein included hain."
     )
     await update.message.reply_text(text, parse_mode="HTML")
@@ -388,7 +361,6 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total, wins, losses, draws, pending = db_stats()
     completed = wins + losses + draws
     winrate = (wins / completed) * 100 if completed else 0
-
     text = (
         "📊 <b>STATISTICS</b>\n\n"
         f"Total: <b>{total}</b>\n"
@@ -405,7 +377,6 @@ async def telegram_main():
     print("Telegram: initializing...")
     if not verify_telegram():
         return
-
     try:
         application = ApplicationBuilder().token(BOT_TOKEN).build()
         application.add_handler(CommandHandler("start", cmd_start))
@@ -413,17 +384,10 @@ async def telegram_main():
         application.add_handler(CommandHandler("market", cmd_market))
         application.add_handler(CommandHandler("stats", cmd_stats))
 
-        print("Telegram: application initializing...")
         await application.initialize()
-        print("Telegram: application initialized")
-
         await application.start()
-        print("Telegram: application started")
-
         if application.updater is None:
             raise RuntimeError("Telegram updater is unavailable")
-
-        print("Telegram: starting polling...")
         await application.updater.start_polling(drop_pending_updates=True)
 
         telegram_status = "LIVE"
@@ -433,11 +397,8 @@ async def telegram_main():
             await asyncio.sleep(3600)
     except Exception as e:
         telegram_status = "ERROR"
-        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        print("TELEGRAM THREAD ERROR")
-        print(repr(e))
+        print("TELEGRAM THREAD ERROR:", repr(e))
         traceback.print_exc()
-        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 
 def telegram_thread():
     try:
@@ -458,27 +419,27 @@ def rsi(series, period=14):
     rs = avg_gain / avg_loss.replace(0, np.nan)
     result = 100 - (100 / (1 + rs))
     result = result.where(~((avg_loss == 0) & (avg_gain > 0)), 100)
-    result = result.where(~((avg_gain == 0) & (avg_loss > 0)), 0)
+    result = result.where(~((avg_gain == 0) & (avg_loss > 0)), :
+0)
     return result
 
-def atr(df, period=14):
-    previous_close = df["close"].shift(1)
-    tr = pd.concat([
-        df["high"] - df["low"],
+def at           r(df, period=14):
+    raw previous_close = df["close"]. =shift(1)
+    tr = raw pd.concat([
+       [" df["high"] - df["low"],
         (df["high"] - previous_close).abs(),
         (df["low"] - previous_close).abs(),
     ], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
 # =========================================================
-# QUOTEX CANDLE HELPERS
+# CANDLES
 # =========================================================
 def normalize_candles(raw):
     if raw is None:
         return None
     if isinstance(raw, dict):
-        if "data" in raw:
-            raw = raw["data"]
+        if "data" in rawdata"]
         elif "candles" in raw:
             raw = raw["candles"]
         else:
@@ -535,9 +496,7 @@ async def get_candles_async(client, symbol):
 # ANALYSIS
 # =========================================================
 def analyze(df):
-    if df is None:
-        return None
-    if len(df) < 60:
+    if df is None or len(df) < 60:
         return None
 
     data = df.copy()
@@ -592,7 +551,6 @@ def analyze(df):
         score = score_put
 
     confidence = min(95, 50 + score * 5)
-
     return {
         "direction": direction,
         "confidence": confidence,
@@ -601,10 +559,9 @@ def analyze(df):
     }
 
 # =========================================================
-# ASSET TEST (WITH CACHE)
+# ASSET FIND
 # =========================================================
 async def find_working_asset(client, base_name):
-    # Pehle cache check karo
     cached = resolved_symbols.get(base_name)
     if cached:
         df = await get_candles_async(client, cached)
@@ -612,8 +569,7 @@ async def find_working_asset(client, base_name):
             return cached, df
         resolved_symbols.pop(base_name, None)
 
-    candidates = ASSETS.get(base_name, [])
-    for symbol in candidates:
+    for symbol in ASSETS.get(base_name, []):
         try:
             df = await get_candles_async(client, symbol)
             if df is not None and len(df) >= 60:
@@ -641,11 +597,9 @@ async def generate_signal(client, base_name):
     entry_time = int(current_candle["time"])
     now = int(time.time())
 
-    # ✅ FIX 1: Sirf fresh candle ke pehle 3 second mein signal
     if now - entry_time > ENTRY_WINDOW_SECONDS:
         return
 
-    # ✅ FIX 2: Pichli candle poori band honi chahiye
     try:
         prev_candle_time = int(df.iloc[-2]["time"])
         if prev_candle_time + PERIOD != entry_time:
@@ -653,7 +607,6 @@ async def generate_signal(client, base_name):
     except Exception:
         return
 
-    # ✅ FIX 3: Latest candle stale na ho
     if entry_time + PERIOD < now - 5:
         return
 
@@ -681,8 +634,7 @@ async def generate_signal(client, base_name):
         "guaranteed win probability nahi."
     )
 
-    print(f"SIGNAL | {symbol} | {direction} | "
-          f"Entry={entry} | Confidence={confidence:.0f}%")
+    print(f"SIGNAL | {symbol} | {direction} | Entry={entry} | Conf={confidence:.0f}%")
 
     db_insert(
         asset=symbol,
@@ -727,24 +679,20 @@ async def process_outcomes(client):
                 continue
 
             target = None
-            expiry_time = item["expiry_time"]
             for _, candle in df.iterrows():
-                candle_time = int(candle["time"])
-                if candle_time >= expiry_time:
+                if int(candle["time"]) >= item["expiry_time"]:
                     target = candle
                     break
 
             if target is None:
-                print("Outcome: target candle not available:", symbol)
+                print("Outcome: target not available:", symbol)
                 continue
 
             expiry_close = float(target["close"])
             entry = float(item["entry"])
             direction = item["direction"]
-
             difference = abs(expiry_close - entry)
 
-            # ✅ FIX 4: Per-asset DRAW threshold
             if "BTC" in symbol.upper():
                 threshold = 0.5
             elif "XAU" in symbol.upper() or "GOLD" in symbol.upper():
@@ -760,16 +708,10 @@ async def process_outcomes(client):
                 result = "WIN" if expiry_close < entry else "LOSS"
 
             entry_dt = datetime.fromtimestamp(item["entry_time"], timezone.utc)
-
-            db_update(
-                asset=symbol,
-                entry_time=entry_dt,
-                expiry_close=expiry_close,
-                result=result,
-            )
+            db_update(asset=symbol, entry_time=entry_dt,
+                      expiry_close=expiry_close, result=result)
 
             emoji = {"WIN": "✅", "LOSS": "❌", "DRAW": "➖"}.get(result, "ℹ️")
-
             text = (
                 f"{emoji} <b>RESULT</b>\n\n"
                 f"📊 {symbol}\n"
@@ -778,14 +720,12 @@ async def process_outcomes(client):
                 f"Close: <b>{expiry_close:.8f}</b>\n"
                 f"Result: <b>{result}</b>"
             )
-
             print(f"RESULT | {symbol} | {direction} | {result}")
             send_telegram(text)
 
             with pending_lock:
                 pending_outcomes[:] = [
-                    p for p in pending_outcomes
-                    if p["id"] != item["id"]
+                    p for p in pending_outcomes if p["id"] != item["id"]
                 ]
 
         except Exception as e:
@@ -796,14 +736,12 @@ async def process_outcomes(client):
 # QUOTEX ENGINE
 # =========================================================
 async def quotex_engine():
-    global quotex_client
-    global quotex_status
+    global quotex_client, quotex_status
 
     if not QUOTEX_EMAIL:
         quotex_status = "EMAIL_MISSING"
         print("ERROR: QUOTEX_EMAIL missing")
         return
-
     if not QUOTEX_PASSWORD:
         quotex_status = "PASSWORD_MISSING"
         print("ERROR: QUOTEX_PASSWORD missing")
@@ -845,11 +783,10 @@ async def quotex_engine():
 
             test_symbol, test_df = await find_working_asset(client, "EURUSD")
             if test_symbol:
-                print(f"Quotex candle test OK: {test_symbol} {len(test_df)} candles")
+                print(f"Candle test OK: {test_symbol} {len(test_df)} candles")
             else:
-                print("WARNING: EURUSD candle test returned no data")
+                print("WARNING: EURUSD test no data")
 
-            # Main scanner
             while True:
                 try:
                     try:
@@ -872,10 +809,7 @@ async def quotex_engine():
                             traceback.print_exc()
 
                     await process_outcomes(client)
-
-                    # ✅ FIX 5: Signal memory prune
                     prune_signal_memory(3600)
-
                     await asyncio.sleep(SCAN_DELAY)
 
                 except Exception as e:
@@ -885,11 +819,8 @@ async def quotex_engine():
 
         except Exception as e:
             quotex_status = "ERROR"
-            print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-            print("QUOTEX ENGINE ERROR")
-            print(repr(e))
+            print("QUOTEX ENGINE ERROR:", repr(e))
             traceback.print_exc()
-            print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
             await asyncio.sleep(15)
 
 def quotex_thread():
