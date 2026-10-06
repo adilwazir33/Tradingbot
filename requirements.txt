@@ -3,5 +3,5 @@ requests==2.34.2
 pandas==2.2.2
 numpy==1.26.4
 python-telegram-bot==20.7
-pyquotex==1.1.0
-psycopg2-binary==2.9.13
+psycopg2-binary
+pyquotex @ git+https://github.com/cleitonleonel/pyquotex.git
