@@ -1,747 +1,656 @@
 import os
 import time
+import threading
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import requests
-import pandas as pd
 import numpy as np
+import pandas as pd
 from flask import Flask
-from threading import Thread
-# ============================================================
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
+# =========================================================
 # CONFIG
-# ============================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# =========================================================
+TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
+TWELVE_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
+SCAN_INTERVAL = 300  # 5 minutes
 SYMBOLS = {
-    "XAUUSD.r": "XAU/USD",
-    "EURUSD.r": "EUR/USD",
-    "BTCUSD.r": "BTC/USD",
+    "XAUUSD.r": {
+        "td_symbol": "XAU/USD",
+        "name": "GOLD",
+    },
+    "EURUSD.r": {
+        "td_symbol": "EUR/USD",
+        "name": "EURUSD.r",
+    },
+    "BTCUSD.r": {
+        "td_symbol": "BTC/USD",
+        "name": "BTCUSD.r",
+    },
 }
-INTERVALS = {
-    "M15": "15min",
-    "H1": "1h",
-    "H4": "4h",
+TIMEFRAMES = {
+    "4H": "4h",
+    "1H": "1h",
+    "15M": "15min",
 }
-SL_ATR = 1.20
-TP1_ATR = 1.50
-TP2_ATR = 2.50
-# Scan every 5 minutes
-SCAN_SECONDS = 300
-API_URL = "https://api.twelvedata.com/time_series"
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-app = Flask(__name__)
-# ============================================================
-# HEALTH
-# ============================================================
-@app.route("/")
+# Strategy
+EMA_FAST = 21
+EMA_MID = 50
+EMA_SLOW = 200
+RSI_PERIOD = 14
+ATR_PERIOD = 14
+SL_ATR = 1.2
+TP1_ATR = 1.5
+TP2_ATR = 2.5
+TP3_ATR = 3.5
+# Sideways threshold
+EMA_SIDEWAYS_PCT = 0.05
+PRICE_EMA200_SIDEWAYS_PCT = 0.10
+DUBAI_TZ = ZoneInfo("Asia/Dubai")
+# =========================================================
+# FLASK
+# =========================================================
+flask_app = Flask(__name__)
+@flask_app.route("/")
 def home():
-    return "ADIL 3-SYMBOL MARKET MOOD BOT LIVE"
-def flask_server():
+    return "ADIL PRO FIXED LIVE"
+@flask_app.route("/health")
+def health():
+    return "OK"
+def run_flask():
     port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
-# ============================================================
+    flask_app.run(host="0.0.0.0", port=port)
+# =========================================================
 # TELEGRAM
-# ============================================================
-def telegram_request(method, payload=None, timeout=30):
-    if not BOT_TOKEN:
-        print("ERROR: BOT_TOKEN missing")
-        return None
-    url = f"{TELEGRAM_API}/{method}"
+# =========================================================
+telegram_app = None
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "🟢 ADIL PRO FIXED\n\n"
+        "Bot is online and scanning.\n\n"
+        "✅ Telegram\n"
+        "✅ Twelve Data\n"
+        "✅ 4H\n"
+        "✅ 1H\n"
+        "✅ 15M\n\n"
+        "Pairs:\n"
+        "🟡 GOLD (XAUUSD.r)\n"
+        "💱 EURUSD.r\n"
+        "₿ BTCUSD.r\n\n"
+        "Commands:\n"
+        "/start - bot status\n"
+        "/status - system status\n"
+        "/test - Telegram test"
+    )
+    await update.message.reply_text(msg)
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    api_status = "✅ FOUND" if TWELVE_API_KEY else "❌ MISSING"
+    chat_status = "✅ CONFIGURED" if CHAT_ID else "❌ MISSING"
+    msg = (
+        "📊 ADIL PRO FIXED STATUS\n\n"
+        f"Twelve Data API: {api_status}\n"
+        f"Telegram Chat ID: {chat_status}\n"
+        "Timeframes: 4H / 1H / 15M\n"
+        "Pairs: GOLD / EURUSD.r / BTCUSD.r\n"
+        "Scan: Every 5 minutes\n"
+        "Execution: Manual MT5\n"
+        "Broker: Lirunex MT5\n"
+        "Data: Twelve Data public feed"
+    )
+    await update.message.reply_text(msg)
+async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🟢 ADIL PRO FIXED TEST OK\n"
+        "Telegram connection is working."
+    )
+def send_telegram(message):
+    if not TOKEN or not CHAT_ID:
+        print("Telegram configuration missing")
+        return False
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     try:
         response = requests.post(
             url,
-            json=payload or {},
-            timeout=timeout,
+            data={
+                "chat_id": CHAT_ID,
+                "text": message,
+            },
+            timeout=20,
         )
-        data = response.json()
-        if not response.ok or not data.get("ok"):
-            print(
-                f"Telegram {method} error:",
-                data.get("description", response.text),
-            )
-            return None
-        return data
+        if response.ok:
+            print("Telegram message sent: OK")
+            return True
+        print("Telegram error:", response.text)
+        return False
     except Exception as e:
-        print(f"Telegram {method} exception:", e)
-        return None
-def send_telegram(message, chat_id=None):
-    target_chat = chat_id or CHAT_ID
-    if not BOT_TOKEN:
-        print("ERROR: BOT_TOKEN missing")
+        print("Telegram exception:", e)
         return False
-    if not target_chat:
-        print("ERROR: CHAT_ID missing")
-        return False
-    result = telegram_request(
-        "sendMessage",
-        {
-            "chat_id": target_chat,
-            "text": message,
-            "parse_mode": "HTML",
-        },
-        timeout=20,
-    )
-    if result:
-        print("Telegram message sent: OK")
-        return True
-    print("Telegram message sent: FAILED")
-    return False
-def telegram_check():
-    if not BOT_TOKEN:
-        print("TELEGRAM STATUS: BOT_TOKEN missing")
-        return False
-    result = telegram_request(
-        "getMe",
-        {},
-        timeout=15,
-    )
-    if not result:
-        print("TELEGRAM STATUS: FAILED")
-        return False
-    bot = result["result"]
-    print(
-        "TELEGRAM STATUS: OK | "
-        f"@{bot.get('username', 'unknown')}"
-    )
-    return True
-def telegram_startup_message():
-    message = """
-<b>🟢 ADIL MARKET MOOD BOT ONLINE</b>
-✅ Telegram Connected
-✅ Twelve Data Configured
-📊 Scanner Active
-<b>Symbols:</b>
-🟡 XAUUSD.r
-🔵 EURUSD.r
-🟠 BTCUSD.r
-<b>Timeframes:</b>
-M15 + H1 + H4
-<b>Broker:</b> Lirunex MT5
-<b>Execution:</b> Manual
-⚠️ Twelve Data public-feed price may differ from Lirunex MT5.
-"""
-    return send_telegram(message)
-def telegram_listener():
-    """
-    Handles /start, /status and /test.
-    """
-    if not BOT_TOKEN:
-        print("Telegram listener stopped: BOT_TOKEN missing")
-        return
-    telegram_request(
-        "deleteWebhook",
-        {"drop_pending_updates": False},
-        timeout=15,
-    )
-    offset = None
-    print("Telegram command listener started")
-    while True:
-        try:
-            payload = {
-                "timeout": 25,
-                "allowed_updates": ["message"],
-            }
-            if offset is not None:
-                payload["offset"] = offset
-            result = telegram_request(
-                "getUpdates",
-                payload,
-                timeout=35,
-            )
-            if not result:
-                time.sleep(5)
-                continue
-            updates = result.get("result", [])
-            for update in updates:
-                offset = update["update_id"] + 1
-                message = update.get("message")
-                if not message:
-                    continue
-                text = message.get("text", "").strip()
-                chat = message.get("chat", {})
-                chat_id = str(
-                    chat.get("id", "")
-                )
-                if CHAT_ID and chat_id != str(CHAT_ID):
-                    print(
-                        f"Ignored Telegram command from chat {chat_id}"
-                    )
-                    continue
-                if text.startswith("/start"):
-                    send_telegram(
-                        """
-<b>🟢 ADIL MARKET MOOD BOT</b>
-Bot is online and scanning.
-✅ Telegram
-✅ Twelve Data
-✅ XAUUSD.r
-✅ EURUSD.r
-✅ BTCUSD.r
-✅ M15
-✅ H1
-✅ H4
-Every 5 minutes:
-📊 All 3 pairs
-🟢 BUY / 🔴 SELL mood
-Entry + SL + TP1 + TP2
-Commands:
-/start - bot status
-/status - system status
-/test - Telegram test
-""",
-                        chat_id,
-                    )
-                elif text.startswith("/status"):
-                    send_telegram(
-                        """
-<b>📊 ADIL BOT STATUS</b>
-🟢 Render: Running
-🟢 Telegram: Connected
-🟢 Twelve Data: Configured
-🟢 Scanner: Active
-<b>Symbols:</b>
-XAUUSD.r
-EURUSD.r
-BTCUSD.r
-<b>Timeframes:</b>
-M15 + H1 + H4
-<b>Scan interval:</b>
-5 minutes
-""",
-                        chat_id,
-                    )
-                elif text.startswith("/test"):
-                    send_telegram(
-                        """
-<b>🧪 TELEGRAM TEST</b>
-Telegram connection is working correctly.
-🟢 Bot is ready.
-""",
-                        chat_id,
-                    )
-        except Exception as e:
-            print(
-                "Telegram listener error:",
-                e,
-            )
-            time.sleep(5)
-# ============================================================
+# =========================================================
 # TWELVE DATA
-# ============================================================
-def get_market_data(symbol, interval):
-    if not TWELVE_DATA_API_KEY:
-        print(
-            "ERROR: TWELVE_DATA_API_KEY missing"
-        )
+# =========================================================
+def get_candles(symbol, interval, outputsize=260):
+    if not TWELVE_API_KEY:
+        print("Twelve Data API key missing")
         return None
+    url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol,
         "interval": interval,
-        "outputsize": 300,
-        "apikey": TWELVE_DATA_API_KEY,
+        "outputsize": outputsize,
+        "apikey": TWELVE_API_KEY,
         "format": "JSON",
     }
     try:
-        response = requests.get(
-            API_URL,
+        r = requests.get(
+            url,
             params=params,
-            timeout=20,
+            timeout=30,
         )
-        data = response.json()
-        if data.get("status") == "error":
+        data = r.json()
+        if "values" not in data:
             print(
-                f"DATA ERROR {symbol} {interval}:",
-                data.get("message"),
+                f"Twelve Data error for {symbol} {interval}:",
+                data
             )
             return None
-        values = data.get("values")
-        if not values:
-            print(
-                f"No data: {symbol} {interval}"
-            )
+        df = pd.DataFrame(data["values"])
+        if df.empty:
             return None
-        df = pd.DataFrame(values)
-        required = [
-            "datetime",
-            "open",
-            "high",
-            "low",
-            "close",
-        ]
-        for column in required:
-            if column not in df.columns:
-                print(
-                    f"Missing {column}: "
-                    f"{symbol} {interval}"
+        # Numeric conversion
+        for col in ["open", "high", "low", "close", "volume"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(
+                    df[col],
+                    errors="coerce"
                 )
-                return None
-        df["time"] = pd.to_datetime(
-            df["datetime"]
+        df["datetime"] = pd.to_datetime(
+            df["datetime"],
+            errors="coerce"
         )
-        for column in [
-            "open",
-            "high",
-            "low",
-            "close",
-        ]:
-            df[column] = pd.to_numeric(
-                df[column],
-                errors="coerce",
-            )
-        if "volume" in df.columns:
-            df["volume"] = pd.to_numeric(
-                df["volume"],
-                errors="coerce",
-            )
-        else:
-            df["volume"] = 0.0
+        df = df.sort_values("datetime").reset_index(drop=True)
+        # Remove invalid rows
         df = df.dropna(
-            subset=[
-                "open",
-                "high",
-                "low",
-                "close",
-            ]
-        )
-        df = (
-            df
-            .sort_values("time")
-            .reset_index(drop=True)
-        )
-        print(
-            f"DATA OK | {symbol} | "
-            f"{interval} | "
-            f"{len(df)} candles"
-        )
+            subset=["open", "high", "low", "close"]
+        ).reset_index(drop=True)
         return df
     except Exception as e:
         print(
-            f"Market data error "
-            f"{symbol} {interval}:",
-            e,
+            f"Candle request exception "
+            f"{symbol} {interval}: {e}"
         )
         return None
-# ============================================================
+# =========================================================
 # INDICATORS
-# ============================================================
-def ema(series, period):
-    return series.ewm(
-        span=period,
-        adjust=False,
-    ).mean()
-def rsi(series, period=14):
-    delta = series.diff()
+# =========================================================
+def calculate_rsi(close, period=14):
+    delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
     avg_gain = gain.ewm(
         alpha=1 / period,
         min_periods=period,
-        adjust=False,
+        adjust=False
     ).mean()
     avg_loss = loss.ewm(
         alpha=1 / period,
         min_periods=period,
-        adjust=False,
+        adjust=False
     ).mean()
-    rs = avg_gain / avg_loss.replace(
-        0,
-        np.nan,
-    )
-    return 100 - (
-        100 / (1 + rs)
-    )
-def atr(df, period=14):
-    high_low = (
-        df["high"] - df["low"]
-    )
-    high_close = (
-        df["high"]
-        - df["close"].shift()
-    ).abs()
-    low_close = (
-        df["low"]
-        - df["close"].shift()
-    ).abs()
-    true_range = pd.concat(
-        [
-            high_low,
-            high_close,
-            low_close,
-        ],
-        axis=1,
-    ).max(axis=1)
-    return true_range.ewm(
-        alpha=1 / period,
-        min_periods=period,
-        adjust=False,
-    ).mean()
-# ============================================================
-# TIMEFRAME MOOD ANALYSIS
-# ============================================================
-def analyze_mood(df):
-    if df is None or len(df) < 220:
-        return None
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+def add_indicators(df):
     df = df.copy()
-    df["ema21"] = ema(
-        df["close"],
-        21,
+    close = df["close"]
+    df["ema21"] = close.ewm(
+        span=EMA_FAST,
+        adjust=False
+    ).mean()
+    df["ema50"] = close.ewm(
+        span=EMA_MID,
+        adjust=False
+    ).mean()
+    df["ema200"] = close.ewm(
+        span=EMA_SLOW,
+        adjust=False
+    ).mean()
+    df["rsi"] = calculate_rsi(
+        close,
+        RSI_PERIOD
     )
-    df["ema50"] = ema(
-        df["close"],
-        50,
-    )
-    df["ema200"] = ema(
-        df["close"],
-        200,
-    )
-    df["rsi"] = rsi(
-        df["close"],
-        14,
-    )
-    df["atr"] = atr(
-        df,
-        14,
-    )
-    df["volume_avg"] = (
-        df["volume"]
-        .rolling(20)
-        .mean()
-    )
-    # Last CLOSED candle
-    row = df.iloc[-2]
-    previous = df.iloc[-3]
-    buy = 0
-    sell = 0
-    # EMA trend
-    if row["ema21"] > row["ema50"]:
-        buy += 2
-    elif row["ema21"] < row["ema50"]:
-        sell += 2
-    # Long-term trend
-    if row["close"] > row["ema200"]:
-        buy += 2
-    elif row["close"] < row["ema200"]:
-        sell += 2
-    # RSI
-    if 52 <= row["rsi"] <= 68:
-        buy += 1
-    elif 32 <= row["rsi"] <= 48:
-        sell += 1
+    prev_close = close.shift(1)
+    tr1 = df["high"] - df["low"]
+    tr2 = (df["high"] - prev_close).abs()
+    tr3 = (df["low"] - prev_close).abs()
+    true_range = pd.concat(
+        [tr1, tr2, tr3],
+        axis=1
+    ).max(axis=1)
+    df["atr"] = true_range.rolling(
+        ATR_PERIOD
+    ).mean()
     # Momentum
-    if row["close"] > previous["close"]:
-        buy += 1
-    elif row["close"] < previous["close"]:
-        sell += 1
-    # Volume
-    if (
-        row["volume"] > 0
-        and row["volume_avg"] > 0
-        and row["volume"]
-        > row["volume_avg"]
+    df["momentum"] = close.pct_change(5) * 100
+    # Volume if available
+    if "volume" in df.columns:
+        df["volume_ma"] = df["volume"].rolling(20).mean()
+    return df
+# =========================================================
+# PRICE FORMATTING
+# =========================================================
+def decimals_for(symbol, price):
+    if symbol == "BTCUSD.r":
+        return 2
+    if symbol == "XAUUSD.r":
+        return 2
+    return 5
+def fmt_price(symbol, price):
+    if price is None or not np.isfinite(price):
+        return "N/A"
+    decimals = decimals_for(symbol, price)
+    return f"{price:.{decimals}f}"
+# =========================================================
+# MARKET ANALYSIS
+# =========================================================
+def analyze_market(df, symbol):
+    if df is None or len(df) < 220:
+        return {
+            "status": "DATA ERROR",
+            "side": None,
+            "strength": 0,
+            "price": None,
+        }
+    df = add_indicators(df)
+    row = df.iloc[-1]
+    price = float(row["close"])
+    ema21 = float(row["ema21"])
+    ema50 = float(row["ema50"])
+    ema200 = float(row["ema200"])
+    rsi = float(row["rsi"])
+    atr = float(row["atr"])
+    momentum = float(row["momentum"])
+    if not all(
+        np.isfinite(x)
+        for x in [
+            price,
+            ema21,
+            ema50,
+            ema200,
+            rsi,
+            atr,
+            momentum,
+        ]
     ):
-        if row["close"] > previous["close"]:
-            buy += 1
-        elif row["close"] < previous["close"]:
-            sell += 1
-    if not np.isfinite(row["atr"]):
-        return None
-    # --------------------------------------------------------
-    # IMPORTANT:
-    # We ALWAYS choose a market mood.
-    # This is NOT the same as a confirmed trade signal.
-    # --------------------------------------------------------
-    if buy > sell:
+        return {
+            "status": "DATA ERROR",
+            "side": None,
+            "strength": 0,
+            "price": price,
+        }
+    # -----------------------------------------------------
+    # BUY SCORE
+    # -----------------------------------------------------
+    buy_score = 0
+    sell_score = 0
+    # EMA 21 / 50
+    if ema21 > ema50:
+        buy_score += 2
+    elif ema21 < ema50:
+        sell_score += 2
+    # EMA 200
+    if price > ema200:
+        buy_score += 2
+    elif price < ema200:
+        sell_score += 2
+    # RSI
+    if rsi >= 55:
+        buy_score += 1
+    elif rsi <= 45:
+        sell_score += 1
+    # Momentum
+    if momentum > 0:
+        buy_score += 1
+    elif momentum < 0:
+        sell_score += 1
+    # Volume
+    if "volume" in df.columns:
+        volume = row["volume"]
+        volume_ma = row["volume_ma"]
+        if (
+            pd.notna(volume)
+            and pd.notna(volume_ma)
+            and volume_ma > 0
+            and volume > volume_ma
+        ):
+            if buy_score >= sell_score:
+                buy_score += 1
+            else:
+                sell_score += 1
+    max_score = 7
+    # -----------------------------------------------------
+    # SIDEWAYS DETECTION
+    # -----------------------------------------------------
+    ema_spread_pct = (
+        abs(ema21 - ema50) / price
+    ) * 100
+    price_ema200_pct = (
+        abs(price - ema200) / price
+    ) * 100
+    sideways = (
+        ema_spread_pct < EMA_SIDEWAYS_PCT
+        and price_ema200_pct < PRICE_EMA200_SIDEWAYS_PCT
+    )
+    # -----------------------------------------------------
+    # DIRECTION
+    # -----------------------------------------------------
+    if buy_score > sell_score:
         side = "BUY"
-    elif sell > buy:
+        score = buy_score
+    elif sell_score > buy_score:
         side = "SELL"
+        score = sell_score
     else:
-        # If perfectly tied, use candle direction
-        if row["close"] >= previous["close"]:
+        # Tie breaker
+        if price >= ema21:
             side = "BUY"
         else:
             side = "SELL"
-    return {
-        "side": side,
-        "buy_score": buy,
-        "sell_score": sell,
-        "score": max(buy, sell),
-        "price": float(row["close"]),
-        "atr": float(row["atr"]),
+        score = max(buy_score, sell_score)
+    # -----------------------------------------------------
+    # STRENGTH
+    # -----------------------------------------------------
+    strength_map = {
+        0: 0,
+        1: 1,
+        2: 3,
+        3: 4,
+        4: 6,
+        5: 7,
+        6: 9,
+        7: 10,
     }
-# ============================================================
-# BUILD 3-TIMEFRAME MARKET MOOD
-# ============================================================
-def build_market_mood(display_symbol):
-    api_symbol = SYMBOLS[display_symbol]
-    frames = {}
-    for name, interval in INTERVALS.items():
-        df = get_market_data(
-            api_symbol,
-            interval,
-        )
-        if df is None:
-            print(
-                f"FAILED DATA | "
-                f"{display_symbol} | "
-                f"{name}"
-            )
-            return None
-        frames[name] = df
-    m15 = analyze_mood(
-        frames["M15"]
-    )
-    h1 = analyze_mood(
-        frames["H1"]
-    )
-    h4 = analyze_mood(
-        frames["H4"]
-    )
-    if not m15 or not h1 or not h4:
-        return None
-    m15_side = m15["side"]
-    h1_side = h1["side"]
-    h4_side = h4["side"]
-    print(
-        f"MOOD | {display_symbol} | "
-        f"M15={m15_side} "
-        f"H1={h1_side} "
-        f"H4={h4_side}"
-    )
-    # Strong confirmation
-    confirmed = (
-        m15_side
-        == h1_side
-        == h4_side
-    )
-    # M15 is used for entry/SL/TP
-    entry = m15["price"]
-    atr_value = m15["atr"]
-    if (
-        not np.isfinite(atr_value)
-        or atr_value <= 0
-    ):
-        return None
-    if m15_side == "BUY":
-        sl = (
-            entry
-            - SL_ATR * atr_value
-        )
-        tp1 = (
-            entry
-            + TP1_ATR * atr_value
-        )
-        tp2 = (
-            entry
-            + TP2_ATR * atr_value
-        )
+    strength = strength_map.get(score, 0)
+    # -----------------------------------------------------
+    # STATUS
+    # -----------------------------------------------------
+    if sideways or score <= 2:
+        status = "WAIT"
+    elif score >= 6:
+        status = f"{side} STRONG"
+    elif score == 5:
+        status = side
     else:
-        sl = (
-            entry
-            + SL_ATR * atr_value
-        )
-        tp1 = (
-            entry
-            - TP1_ATR * atr_value
-        )
-        tp2 = (
-            entry
-            - TP2_ATR * atr_value
-        )
+        status = f"{side} WEAK"
+    # -----------------------------------------------------
+    # ENTRY / SL / TPS
+    # -----------------------------------------------------
+    entry = price
+    if side == "BUY":
+        sl = entry - (SL_ATR * atr)
+        tp1 = entry + (TP1_ATR * atr)
+        tp2 = entry + (TP2_ATR * atr)
+        tp3 = entry + (TP3_ATR * atr)
+    else:
+        sl = entry + (SL_ATR * atr)
+        tp1 = entry - (TP1_ATR * atr)
+        tp2 = entry - (TP2_ATR * atr)
+        tp3 = entry - (TP3_ATR * atr)
     return {
-        "symbol": display_symbol,
-        "side": m15_side,
+        "status": status,
+        "side": side,
+        "score": score,
+        "strength": strength,
+        "price": price,
         "entry": entry,
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
-        "m15": m15_side,
-        "h1": h1_side,
-        "h4": h4_side,
-        "confirmed": confirmed,
-        "score": m15["score"],
-        "buy_score": m15["buy_score"],
-        "sell_score": m15["sell_score"],
+        "tp3": tp3,
+        "atr": atr,
+        "rsi": rsi,
+        "momentum": momentum,
+        "ema_spread_pct": ema_spread_pct,
+        "price_ema200_pct": price_ema200_pct,
+        "sideways": sideways,
     }
-# ============================================================
-# PRICE FORMATTING
-# ============================================================
-def price_text(symbol, value):
-    if symbol in [
-        "BTCUSD.r",
-        "XAUUSD.r",
-    ]:
-        return f"{value:.2f}"
-    return f"{value:.5f}"
-# ============================================================
-# 3-PAIR TELEGRAM MESSAGE
-# ============================================================
-def market_mood_message(results):
-    lines = []
-    lines.append(
-        "<b>📊 ADIL MARKET MOOD</b>"
+# =========================================================
+# SIGNAL TEXT
+# =========================================================
+def pair_header(symbol, result):
+    name = SYMBOLS[symbol]["name"]
+    if result["status"] == "WAIT":
+        return f"⏳ {name} ({symbol}) — WAIT"
+    if result["status"].startswith("BUY"):
+        return f"🟢 {name} ({symbol}) — {result['status']}"
+    if result["status"].startswith("SELL"):
+        return f"🔴 {name} ({symbol}) — {result['status']}"
+    return f"⚪ {name} ({symbol}) — {result['status']}"
+def format_result(symbol, result):
+    header = pair_header(symbol, result)
+    price = fmt_price(
+        symbol,
+        result.get("price")
     )
-    lines.append(
-        "<i>Updated every 5 minutes</i>"
+    # Data error
+    if result["status"] == "DATA ERROR":
+        return (
+            f"⚠️ {header}\n"
+            f"Price: {price}\n"
+            f"Data unavailable"
+        )
+    # WAIT / sideways
+    if result["status"] == "WAIT":
+        sideways_pct = result.get(
+            "ema_spread_pct",
+            0
+        )
+        return (
+            f"{header}\n"
+            f"Price: {price}\n"
+            f"Sideways {sideways_pct:.3f}%\n"
+            f"Strength: {result['strength']}/10"
+        )
+    return (
+        f"{header}\n"
+        f"Price: {price}\n"
+        f"Entry: {fmt_price(symbol, result['entry'])}\n"
+        f"SL: {fmt_price(symbol, result['sl'])}\n"
+        f"TP1: {fmt_price(symbol, result['tp1'])}\n"
+        f"TP2: {fmt_price(symbol, result['tp2'])}\n"
+        f"TP3: {fmt_price(symbol, result['tp3'])}\n"
+        f"Strength: {result['strength']}/10"
     )
-    lines.append("")
-    for result in results:
-        symbol = result["symbol"]
-        if result["side"] == "BUY":
-            emoji = "🟢"
-        else:
-            emoji = "🔴"
-        if result["confirmed"]:
-            status = "✅ M15+H1+H4 CONFIRMED"
-        else:
-            status = "⚠️ MIXED TIMEFRAMES"
-        lines.append(
-            f"<b>{emoji} {symbol} — "
-            f"{result['side']}</b>"
-        )
-        lines.append(
-            f"Entry: "
-            f"{price_text(symbol, result['entry'])}"
-        )
-        lines.append(
-            f"SL: "
-            f"{price_text(symbol, result['sl'])}"
-        )
-        lines.append(
-            f"TP1: "
-            f"{price_text(symbol, result['tp1'])}"
-        )
-        lines.append(
-            f"TP2: "
-            f"{price_text(symbol, result['tp2'])}"
-        )
-        lines.append(
-            f"M15: {result['m15']} | "
-            f"H1: {result['h1']} | "
-            f"H4: {result['h4']}"
-        )
-        lines.append(
-            f"{status}"
-        )
-        lines.append("")
-    lines.append(
-        "<b>Data:</b> Twelve Data public feed"
+# =========================================================
+# SCAN
+# =========================================================
+def scan_all_markets():
+    results = {}
+    for tf_name, td_interval in TIMEFRAMES.items():
+        results[tf_name] = {}
+        for symbol, info in SYMBOLS.items():
+            print(
+                f"Scanning {symbol} "
+                f"{tf_name}..."
+            )
+            df = get_candles(
+                info["td_symbol"],
+                td_interval,
+                outputsize=260
+            )
+            result = analyze_market(
+                df,
+                symbol
+            )
+            results[tf_name][symbol] = result
+            # Small delay to reduce API burst/rate-limit risk
+            time.sleep(3)
+    return results
+# =========================================================
+# MESSAGE BUILDER
+# =========================================================
+def build_message(results):
+    now = datetime.now(DUBAI_TZ)
+    timestamp = now.strftime(
+        "%d-%m %I:%M %p"
     )
-    lines.append(
-        "<b>Broker:</b> Lirunex MT5"
-    )
-    lines.append(
-        "<b>Execution:</b> Manual"
-    )
-    lines.append(
-        "⚠️ Public-feed price may differ "
-        "from Lirunex MT5."
-    )
+    lines = [
+        "💰 ADIL PRO FIXED",
+        f"🕐 {timestamp} Dubai",
+        "",
+        "📊 Data: Twelve Data public feed",
+        "🏦 Broker: Lirunex MT5",
+        "⚙️ Execution: Manual",
+        "⚠️ Public feed price may differ from Lirunex MT5",
+        "",
+    ]
+    for tf_name in ["4H", "1H", "15M"]:
+        lines.append(
+            f"===== {tf_name} ====="
+        )
+        for symbol in SYMBOLS:
+            result = results.get(
+                tf_name,
+                {}
+            ).get(
+                symbol
+            )
+            if result is None:
+                result = {
+                    "status": "DATA ERROR",
+                    "price": None,
+                    "strength": 0,
+                }
+            lines.append(
+                format_result(
+                    symbol,
+                    result
+                )
+            )
+            lines.append("")
+    lines.extend([
+        "━━━━━━━━━━━━━━",
+        "⚠️ Signal = technical analysis only",
+        "No profit guarantee.",
+        "Use Lirunex MT5 for actual execution."
+    ])
     return "\n".join(lines)
-# ============================================================
-# SCANNER
-# ============================================================
-def scanner():
-    print("")
-    print("======================================")
-    print("ADIL MARKET MOOD BOT STARTED")
-    print("======================================")
+# =========================================================
+# BACKGROUND SCANNER
+# =========================================================
+def scanner_loop():
+    print("ADIL PRO FIXED SCANNER STARTED")
+    while True:
+        try:
+            print("Starting market scan...")
+            results = scan_all_markets()
+            message = build_message(results)
+            print(message)
+            send_telegram(message)
+        except Exception as e:
+            print(
+                "Scanner error:",
+                repr(e)
+            )
+        print(
+            f"Waiting {SCAN_INTERVAL} seconds..."
+        )
+        time.sleep(SCAN_INTERVAL)
+# =========================================================
+# TELEGRAM STARTUP
+# =========================================================
+def start_telegram():
+    global telegram_app
+    if not TOKEN:
+        print("BOT_TOKEN missing")
+        return
+    if not CHAT_ID:
+        print("CHAT_ID missing")
+        return
+    telegram_app = (
+        Application.builder()
+        .token(TOKEN)
+        .build()
+    )
+    telegram_app.add_handler(
+        CommandHandler(
+            "start",
+            start_command
+        )
+    )
+    telegram_app.add_handler(
+        CommandHandler(
+            "status",
+            status_command
+        )
+    )
+    telegram_app.add_handler(
+        CommandHandler(
+            "test",
+            test_command
+        )
+    )
+    print("Telegram bot starting...")
+    # Send startup message
+    send_telegram(
+        "🟢 ADIL PRO FIXED\n"
+        "Bot is LIVE.\n\n"
+        "✅ Telegram\n"
+        "✅ Twelve Data\n"
+        "✅ 4H\n"
+        "✅ 1H\n"
+        "✅ 15M\n"
+        "✅ GOLD\n"
+        "✅ EURUSD.r\n"
+        "✅ BTCUSD.r\n\n"
+        "📊 Scanning every 5 minutes."
+    )
+    telegram_app.run_polling(
+        drop_pending_updates=True
+    )
+# =========================================================
+# MAIN
+# =========================================================
+if __name__ == "__main__":
+    print("================================")
+    print("ADIL PRO FIXED")
+    print("================================")
     print(
         "Symbols:",
         list(SYMBOLS.keys())
     )
     print(
-        "SCAN_SECONDS:",
-        SCAN_SECONDS
+        "Twelve Data:",
+        "API KEY FOUND"
+        if TWELVE_API_KEY
+        else "API KEY MISSING"
     )
-    if not TWELVE_DATA_API_KEY:
-        print(
-            "ERROR: Twelve Data API key missing"
-        )
-    else:
-        print(
-            "TWELVE DATA STATUS: API KEY FOUND"
-        )
-    if not CHAT_ID:
-        print(
-            "ERROR: CHAT_ID missing"
-        )
-    else:
-        print(
-            "TELEGRAM CHAT_ID: CONFIGURED"
-        )
-    telegram_check()
-    if CHAT_ID:
-        telegram_startup_message()
-    while True:
-        cycle_start = time.time()
-        print("")
-        print("======================================")
-        print("NEW MARKET MOOD CYCLE")
-        print("======================================")
-        results = []
-        for symbol in SYMBOLS:
-            try:
-                result = build_market_mood(
-                    symbol
-                )
-                if not result:
-                    print(
-                        f"{symbol}: "
-                        "Market data unavailable"
-                    )
-                    continue
-                results.append(result)
-                print(
-                    f"{symbol}: "
-                    f"{result['side']} | "
-                    f"M15={result['m15']} "
-                    f"H1={result['h1']} "
-                    f"H4={result['h4']}"
-                )
-            except Exception as e:
-                print(
-                    f"Scanner error "
-                    f"{symbol}:",
-                    e,
-                )
-        # ----------------------------------------------------
-        # Send ONE message containing all available pairs
-        # ----------------------------------------------------
-        if results:
-            message = market_mood_message(
-                results
-            )
-            send_telegram(message)
-        else:
-            print(
-                "No market data available "
-                "for Telegram message."
-            )
-        elapsed = (
-            time.time()
-            - cycle_start
-        )
-        sleep_time = max(
-            5,
-            SCAN_SECONDS - elapsed,
-        )
-        print(
-            f"Scan complete. "
-            f"Next scan in "
-            f"~{sleep_time:.0f} seconds."
-        )
-        time.sleep(
-            sleep_time
-        )
-# ============================================================
-# START
-# ============================================================
-if __name__ == "__main__":
-    Thread(
-        target=flask_server,
-        daemon=True,
-    ).start()
-    Thread(
-        target=telegram_listener,
-        daemon=True,
-    ).start()
-    scanner()
+    print(
+        "Telegram Chat ID:",
+        "CONFIGURED"
+        if CHAT_ID
+        else "MISSING"
+    )
+    # Flask in background
+    flask_thread = threading.Thread(
+        target=run_flask,
+        daemon=True
+    )
+    flask_thread.start()
+    # Scanner in background
+    scanner_thread = threading.Thread(
+        target=scanner_loop,
+        daemon=True
+    )
+    scanner_thread.start()
+    # Telegram polling in main thread
+    start_telegram()
+
+Is code mein hard-coded BTC/GOLD/EURUSD price nahi hai — har scan Twelve Data se candles leta hai aur usi actual returned price par calculation karta hai.
+
+Ek important point: 9 candle requests har 5 minutes hain (3 pairs × 3 timeframes), isliye code requests ke darmiyan delay rakhta hai taake Twelve Data rate-limit ka chance kam ho. Render par purana main.py replace karke redeploy kar dena.
