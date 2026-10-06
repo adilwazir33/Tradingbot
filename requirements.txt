@@ -1,6 +1,5 @@
 Flask
-python-telegram-bot
-quotexapi
-pandas
-psycopg2-binary
 requests
+pandas==2.2.2
+numpy==1.26.4
+python-telegram-bot==20.7
