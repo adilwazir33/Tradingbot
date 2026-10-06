@@ -6,21 +6,17 @@ import asyncio
 
 import threading
 
-import queue
-
-import requests
+import traceback
 
 import sqlite3
 
-import uuid
-
-import math
-
-from collections import OrderedDict
-
 from datetime import datetime, timezone
 
+import requests
+
 import pandas as pd
+
+import numpy as np
 
 from flask import Flask
 
@@ -38,61 +34,57 @@ from telegram.ext import (
 
 from pyquotex.stable_api import Quotex
 
-# ============================================================
+# =========================================================
 
 # CONFIG
 
-# ============================================================
+# =========================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-CHAT_ID = os.getenv("CHAT_ID")
+CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-QUOTEX_EMAIL = os.getenv("QUOTEX_EMAIL")
+QUOTEX_EMAIL = os.getenv("QUOTEX_EMAIL", "").strip()
 
-QUOTEX_PASS = os.getenv("QUOTEX_PASS")
+QUOTEX_PASSWORD = os.getenv("QUOTEX_PASSWORD", "").strip()
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+PORT = int(os.getenv("PORT", "10000"))
+
+VERSION = "v12"
 
 PERIOD = 60
 
-DB_PATH = os.getenv("DB_PATH", "/tmp/quotex_v11.db")
+CANDLE_COUNT = 120
 
-# Main assets requested
+SCAN_DELAY = 5
 
-ASSET_GROUPS = {
+# Do not send duplicate signal for same asset/candle
 
-    "EURUSD": {
+signal_memory = {}
 
-        "normal": ["EURUSD"],
+# Pending outcomes
 
-        "otc": ["EURUSD_otc"],
+pending_outcomes = []
 
-    },
+pending_lock = threading.Lock()
 
-    "BTCUSD": {
+quotex_client = None
 
-        "normal": ["BTCUSD", "BTCUSD-OTC"],
+quotex_status = "NOT_STARTED"
 
-        "otc": ["BTCUSD_otc", "BTCUSD-OTC"],
+telegram_status = "NOT_STARTED"
 
-    },
+last_error = ""
 
-    "XAUUSD": {
+telegram_bot_username = ""
 
-        "normal": ["XAUUSD", "GOLD"],
+# =========================================================
 
-        "otc": ["XAUUSD_otc", "GOLD_otc", "GOLD-OTC"],
+# FLASK
 
-    },
-
-}
-
-BASE_PAIRS = list(ASSET_GROUPS.keys())
-
-# ============================================================
-
-# FLASK / RENDER
-
-# ============================================================
+# =========================================================
 
 app = Flask(__name__)
 
@@ -100,513 +92,391 @@ app = Flask(__name__)
 
 def home():
 
-    return "QUOTEX v11 FULL UPGRADE LIVE"
+    return f"Adil SAFE WIN {VERSION} LIVE"
 
 @app.route("/health")
 
 def health():
 
-    return "OK"
-
-# ============================================================
-
-# GLOBAL STATE
-
-# ============================================================
-
-sent_cache = OrderedDict()
-
-cache_lock = threading.Lock()
-
-outcome_queue = queue.Queue()
-
-last_scanned_entry_ts = None
-
-# ============================================================
-
-# TIME HELPERS
-
-# ============================================================
-
-def normalize_qx_ts(ts):
-
-    try:
-
-        ts = int(float(ts))
-
-    except Exception:
-
-        return 0
-
-    # milliseconds -> seconds
-
-    if ts > 1_000_000_000_000:
-
-        ts //= 1000
-
-    return ts
-
-def utc_dt(ts):
-
-    return datetime.fromtimestamp(
-
-        int(ts),
-
-        tz=timezone.utc
-
-    )
-
-def get_draw_threshold(asset, price):
-
-    """
-
-    Simple absolute draw tolerance.
-
-    This is NOT a broker-defined rule.
-
-    """
-
-    asset_u = asset.upper()
-
-    if "JPY" in asset_u:
-
-        return 0.005
-
-    if "BTC" in asset_u:
-
-        return max(price * 0.00002, 0.01)
-
-    if "XAU" in asset_u or "GOLD" in asset_u:
-
-        return 0.02
-
-    return 0.00002
-
-def get_next_cycle(last_entry=None):
-
-    """
-
-    At 19:27:02:
-
-        analysis candle = 19:26
-
-        entry candle    = 19:27
-
-        expiry candle   = 19:27
-
-        result available around 19:28+
-
-    This avoids calling an already closed candle "Entry OPEN".
-
-    """
-
-    now = time.time()
-
-    current_minute = int(now // PERIOD) * PERIOD
-
-    analysis_ts = current_minute - PERIOD
-
-    entry_ts = current_minute
-
-    if last_entry is not None and entry_ts <= last_entry:
-
-        entry_ts = last_entry + PERIOD
-
-        analysis_ts = entry_ts - PERIOD
-
-    expiry_ts = entry_ts
-
-    expiry_close_ts = entry_ts + PERIOD
-
-    scan_ts = entry_ts + 2
-
-    sleep_sec = max(0, scan_ts - now)
-
     return {
 
-        "analysis_ts": analysis_ts,
+        "status": "ok",
 
-        "entry_ts": entry_ts,
+        "version": VERSION,
 
-        "expiry_ts": expiry_ts,
+        "telegram": telegram_status,
 
-        "expiry_close_ts": expiry_close_ts,
+        "quotex": quotex_status,
 
-        "sleep_sec": sleep_sec,
+        "time": datetime.now(timezone.utc).isoformat(),
 
     }
 
-# ============================================================
+# =========================================================
 
-# CACHE
+# ASSETS
 
-# ============================================================
+# =========================================================
 
-def cache_add(key):
+ASSETS = {
 
-    with cache_lock:
+    "EURUSD": [
 
-        if key in sent_cache:
+        "EURUSD",
 
-            return False
+        "EURUSD_otc",
 
-        sent_cache[key] = True
+        "EURUSD-OTC",
 
-        if len(sent_cache) > 500:
+    ],
 
-            sent_cache.popitem(last=False)
+    "BTCUSD": [
 
-        return True
+        "BTCUSD",
 
-# ============================================================
+        "BTCUSD_otc",
 
-# TELEGRAM
+        "BTCUSD-OTC",
 
-# ============================================================
+    ],
 
-def send_tg(text):
+    "XAUUSD": [
 
-    if not BOT_TOKEN or not CHAT_ID:
+        "XAUUSD",
 
-        print("Telegram credentials missing")
+        "GOLD",
 
-        return False
+        "XAUUSD_otc",
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        "GOLD_otc",
 
-    try:
+        "GOLD-OTC",
 
-        response = requests.post(
+    ],
 
-            url,
+}
 
-            json={
-
-                "chat_id": CHAT_ID,
-
-                "text": text,
-
-            },
-
-            timeout=15,
-
-        )
-
-        if response.status_code == 200:
-
-            return True
-
-        print(
-
-            "Telegram error:",
-
-            response.status_code,
-
-            response.text[:300],
-
-        )
-
-    except Exception as e:
-
-        print("Telegram send error:", e)
-
-    return False
-
-# ============================================================
+# =========================================================
 
 # DATABASE
 
-# ============================================================
+# =========================================================
 
-def get_db_conn():
+SQLITE_DB = "signals.db"
 
-    db_url = os.getenv("DATABASE_URL")
+def db_connection():
 
-    if db_url:
+    return sqlite3.connect(
 
-        import psycopg2
+        SQLITE_DB,
 
-        conn = psycopg2.connect(db_url)
-
-        conn.autocommit = True
-
-        return conn, "postgres"
-
-    conn = sqlite3.connect(
-
-        DB_PATH,
-
-        timeout=30,
+        check_same_thread=False
 
     )
 
-    return conn, "sqlite"
-
-def init_db():
-
-    conn, db_type = get_db_conn()
-
-    cur = conn.cursor()
+def db_init():
 
     try:
 
-        if db_type == "postgres":
+        if DATABASE_URL:
+
+            import psycopg2
+
+            conn = psycopg2.connect(DATABASE_URL)
+
+            cur = conn.cursor()
 
             cur.execute("""
 
                 CREATE TABLE IF NOT EXISTS signals (
 
-                    id TEXT PRIMARY KEY,
+                    id SERIAL PRIMARY KEY,
 
-                    timestamp TEXT,
-
-                    asset TEXT,
-
-                    base_asset TEXT,
-
-                    is_otc INTEGER,
-
-                    signal TEXT,
-
-                    entry_price DOUBLE PRECISION,
-
-                    entry_candle_time BIGINT,
-
-                    expiry_candle_time BIGINT,
-
-                    expiry_close DOUBLE PRECISION,
-
-                    outcome TEXT,
-
-                    rsi DOUBLE PRECISION,
-
-                    confidence TEXT
-
-                )
-
-            """)
-
-        else:
-
-            cur.execute("""
-
-                CREATE TABLE IF NOT EXISTS signals (
-
-                    id TEXT PRIMARY KEY,
-
-                    timestamp TEXT,
+                    created_at TIMESTAMP,
 
                     asset TEXT,
 
-                    base_asset TEXT,
+                    direction TEXT,
 
-                    is_otc INTEGER,
+                    confidence REAL,
 
-                    signal TEXT,
+                    entry REAL,
 
-                    entry_price REAL,
-
-                    entry_candle_time INTEGER,
-
-                    expiry_candle_time INTEGER,
+                    analysis_close REAL,
 
                     expiry_close REAL,
 
-                    outcome TEXT,
+                    result TEXT,
 
-                    rsi REAL,
+                    analysis_time TIMESTAMP,
 
-                    confidence TEXT
+                    entry_time TIMESTAMP,
+
+                    expiry_time TIMESTAMP
 
                 )
 
             """)
 
-        if db_type == "sqlite":
-
             conn.commit()
 
-    finally:
+            cur.close()
 
-        conn.close()
+            conn.close()
 
-def db_insert(data):
+            print("DATABASE: PostgreSQL READY")
+
+            return
+
+    except Exception as e:
+
+        print("DATABASE: PostgreSQL failed")
+
+        print(repr(e))
+
+        print("DATABASE: switching to SQLite")
 
     try:
 
-        conn, db_type = get_db_conn()
+        conn = db_connection()
 
         cur = conn.cursor()
 
-        if db_type == "postgres":
+        cur.execute("""
+
+            CREATE TABLE IF NOT EXISTS signals (
+
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                created_at TEXT,
+
+                asset TEXT,
+
+                direction TEXT,
+
+                confidence REAL,
+
+                entry REAL,
+
+                analysis_close REAL,
+
+                expiry_close REAL,
+
+                result TEXT,
+
+                analysis_time TEXT,
+
+                entry_time TEXT,
+
+                expiry_time TEXT
+
+            )
+
+        """)
+
+        conn.commit()
+
+        conn.close()
+
+        print("DATABASE: SQLite READY")
+
+    except Exception as e:
+
+        print("DATABASE ERROR:", repr(e))
+
+def db_insert(
+
+    asset,
+
+    direction,
+
+    confidence,
+
+    entry,
+
+    analysis_close,
+
+    analysis_time,
+
+    entry_time,
+
+    expiry_time
+
+):
+
+    try:
+
+        if DATABASE_URL:
+
+            import psycopg2
+
+            conn = psycopg2.connect(DATABASE_URL)
+
+            cur = conn.cursor()
 
             cur.execute("""
 
                 INSERT INTO signals (
 
-                    id,
-
-                    timestamp,
+                    created_at,
 
                     asset,
 
-                    base_asset,
+                    direction,
 
-                    is_otc,
+                    confidence,
 
-                    signal,
+                    entry,
 
-                    entry_price,
-
-                    entry_candle_time,
-
-                    expiry_candle_time,
+                    analysis_close,
 
                     expiry_close,
 
-                    outcome,
+                    result,
 
-                    rsi,
+                    analysis_time,
 
-                    confidence
+                    entry_time,
+
+                    expiry_time
 
                 )
 
                 VALUES (
 
-                    %s,%s,%s,%s,%s,%s,%s,
-
-                    %s,%s,%s,%s,%s,%s
+                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
 
                 )
-
-                ON CONFLICT (id) DO NOTHING
 
             """, (
 
-                data["id"],
+                datetime.now(timezone.utc),
 
-                data["timestamp"],
+                asset,
 
-                data["asset"],
+                direction,
 
-                data["base_asset"],
+                confidence,
 
-                data["is_otc"],
+                entry,
 
-                data["signal"],
+                analysis_close,
 
-                data["entry_price"],
+                None,
 
-                data["entry_candle_time"],
+                "PENDING",
 
-                data["expiry_candle_time"],
+                analysis_time,
 
-                data["expiry_close"],
+                entry_time,
 
-                data["outcome"],
-
-                data["rsi"],
-
-                data["confidence"],
+                expiry_time,
 
             ))
 
-        else:
-
-            cur.execute("""
-
-                INSERT OR IGNORE INTO signals (
-
-                    id,
-
-                    timestamp,
-
-                    asset,
-
-                    base_asset,
-
-                    is_otc,
-
-                    signal,
-
-                    entry_price,
-
-                    entry_candle_time,
-
-                    expiry_candle_time,
-
-                    expiry_close,
-
-                    outcome,
-
-                    rsi,
-
-                    confidence
-
-                )
-
-                VALUES (
-
-                    :id,
-
-                    :timestamp,
-
-                    :asset,
-
-                    :base_asset,
-
-                    :is_otc,
-
-                    :signal,
-
-                    :entry_price,
-
-                    :entry_candle_time,
-
-                    :expiry_candle_time,
-
-                    :expiry_close,
-
-                    :outcome,
-
-                    :rsi,
-
-                    :confidence
-
-                )
-
-            """, data)
-
             conn.commit()
 
-        conn.close()
-
-        return True
-
-    except Exception as e:
-
-        print("DB INSERT ERROR:", e)
-
-        try:
+            cur.close()
 
             conn.close()
 
-        except Exception:
+            return
 
-            pass
+    except Exception as e:
 
-        return False
-
-def db_update(signal_id, expiry_close, outcome):
+        print("PostgreSQL INSERT ERROR:", repr(e))
 
     try:
 
-        conn, db_type = get_db_conn()
+        conn = db_connection()
 
         cur = conn.cursor()
 
-        if db_type == "postgres":
+        cur.execute("""
+
+            INSERT INTO signals (
+
+                created_at,
+
+                asset,
+
+                direction,
+
+                confidence,
+
+                entry,
+
+                analysis_close,
+
+                expiry_close,
+
+                result,
+
+                analysis_time,
+
+                entry_time,
+
+                expiry_time
+
+            )
+
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+
+        """, (
+
+            datetime.now(timezone.utc).isoformat(),
+
+            asset,
+
+            direction,
+
+            confidence,
+
+            entry,
+
+            analysis_close,
+
+            None,
+
+            "PENDING",
+
+            analysis_time.isoformat(),
+
+            entry_time.isoformat(),
+
+            expiry_time.isoformat(),
+
+        ))
+
+        conn.commit()
+
+        conn.close()
+
+    except Exception as e:
+
+        print("SQLite INSERT ERROR:", repr(e))
+
+def db_update(
+
+    asset,
+
+    entry_time,
+
+    expiry_close,
+
+    result
+
+):
+
+    try:
+
+        if DATABASE_URL:
+
+            import psycopg2
+
+            conn = psycopg2.connect(DATABASE_URL)
+
+            cur = conn.cursor()
 
             cur.execute("""
 
@@ -614,1753 +484,347 @@ def db_update(signal_id, expiry_close, outcome):
 
                 SET expiry_close=%s,
 
-                    outcome=%s
+                    result=%s
 
-                WHERE id=%s
+                WHERE asset=%s
 
-            """, (
+                AND entry_time=%s
 
-                expiry_close,
-
-                outcome,
-
-                signal_id,
-
-            ))
-
-        else:
-
-            cur.execute("""
-
-                UPDATE signals
-
-                SET expiry_close=?,
-
-                    outcome=?
-
-                WHERE id=?
+                AND result='PENDING'
 
             """, (
 
                 expiry_close,
 
-                outcome,
+                result,
 
-                signal_id,
+                asset,
+
+                entry_time,
 
             ))
 
             conn.commit()
 
-        conn.close()
-
-        return True
-
-    except Exception as e:
-
-        print("DB UPDATE ERROR:", e)
-
-        try:
+            cur.close()
 
             conn.close()
 
-        except Exception:
+            return
 
-            pass
+    except Exception as e:
 
-        return False
+        print("PostgreSQL UPDATE ERROR:", repr(e))
+
+    try:
+
+        conn = db_connection()
+
+        cur = conn.cursor()
+
+        cur.execute("""
+
+            UPDATE signals
+
+            SET expiry_close=?,
+
+                result=?
+
+            WHERE asset=?
+
+            AND entry_time=?
+
+            AND result='PENDING'
+
+        """, (
+
+            expiry_close,
+
+            result,
+
+            asset,
+
+            entry_time.isoformat(),
+
+        ))
+
+        conn.commit()
+
+        conn.close()
+
+    except Exception as e:
+
+        print("SQLite UPDATE ERROR:", repr(e))
 
 def db_stats():
 
-    conn, db_type = get_db_conn()
+    try:
 
-    cur = conn.cursor()
+        if DATABASE_URL:
 
-    def winrate(extra=""):
+            import psycopg2
 
-        cur.execute(f"""
+            conn = psycopg2.connect(DATABASE_URL)
+
+            cur = conn.cursor()
+
+            cur.execute("""
+
+                SELECT
+
+                    COUNT(*),
+
+                    COUNT(*) FILTER (WHERE result='WIN'),
+
+                    COUNT(*) FILTER (WHERE result='LOSS'),
+
+                    COUNT(*) FILTER (WHERE result='DRAW'),
+
+                    COUNT(*) FILTER (WHERE result='PENDING')
+
+                FROM signals
+
+            """)
+
+            result = cur.fetchone()
+
+            cur.close()
+
+            conn.close()
+
+            return result
+
+    except Exception:
+
+        pass
+
+    try:
+
+        conn = db_connection()
+
+        cur = conn.cursor()
+
+        cur.execute("""
 
             SELECT
 
                 COUNT(*),
 
-                SUM(
+                SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END),
 
-                    CASE
+                SUM(CASE WHEN result='LOSS' THEN 1 ELSE 0 END),
 
-                        WHEN outcome='WIN'
+                SUM(CASE WHEN result='DRAW' THEN 1 ELSE 0 END),
 
-                        THEN 1
-
-                        ELSE 0
-
-                    END
-
-                )
+                SUM(CASE WHEN result='PENDING' THEN 1 ELSE 0 END)
 
             FROM signals
 
-            WHERE outcome IN ('WIN','LOSS')
-
-            {extra}
-
         """)
 
-        total, wins = cur.fetchone()
+        result = cur.fetchone()
 
-        total = total or 0
+        conn.close()
 
-        wins = wins or 0
+        return tuple(
 
-        rate = (wins / total * 100) if total else 0
+            0 if x is None else x
 
-        return total, wins, rate
-
-    stats = {}
-
-    stats["ALL"] = winrate()
-
-    for pair in BASE_PAIRS:
-
-        stats[pair] = winrate(
-
-            f"AND base_asset='{pair}'"
+            for x in result
 
         )
 
-    stats["OTC"] = winrate(
+    except Exception:
 
-        "AND is_otc=1"
+        return (0, 0, 0, 0, 0)
 
-    )
+# =========================================================
 
-    stats["NORMAL"] = winrate(
+# TELEGRAM RAW API
 
-        "AND is_otc=0"
+# =========================================================
 
-    )
+def telegram_api(method, payload=None):
 
-    stats["CALL"] = winrate(
-
-        "AND signal='CALL'"
-
-    )
-
-    stats["PUT"] = winrate(
-
-        "AND signal='PUT'"
-
-    )
-
-    stats["HIGH"] = winrate(
-
-        "AND confidence='HIGH'"
-
-    )
-
-    stats["MEDIUM"] = winrate(
-
-        "AND confidence='MEDIUM'"
-
-    )
-
-    conn.close()
-
-    return stats
-
-init_db()
-
-# ============================================================
-
-# QUOTEX LOGIN
-
-# ============================================================
-
-async def login_qx_safe():
-
-    if not QUOTEX_EMAIL or not QUOTEX_PASS:
-
-        print(
-
-            "ERROR: QUOTEX_EMAIL / QUOTEX_PASS missing"
-
-        )
+    if not BOT_TOKEN:
 
         return None
 
-    for attempt in range(1, 4):
+    url = (
 
-        qx = None
+        f"https://api.telegram.org/bot"
 
-        try:
+        f"{BOT_TOKEN}/{method}"
 
-            qx = Quotex(
-
-                email=QUOTEX_EMAIL,
-
-                password=QUOTEX_PASS,
-
-                lang="en",
-
-                host="qxbroker.com",
-
-                period_default=PERIOD,
-
-            )
-
-            ok, reason = await qx.connect()
-
-            if ok:
-
-                print(
-
-                    f"Quotex connected: {reason}"
-
-                )
-
-                return qx
-
-            print(
-
-                f"Quotex login failed "
-
-                f"{attempt}/3: {reason}"
-
-            )
-
-        except Exception as e:
-
-            print(
-
-                f"Quotex login exception "
-
-                f"{attempt}/3: {e}"
-
-            )
-
-        if qx:
-
-            try:
-
-                await qx.close()
-
-            except Exception:
-
-                pass
-
-        await asyncio.sleep(
-
-            min(5 * attempt, 15)
-
-        )
-
-    return None
-
-# ============================================================
-
-# ASSET DISCOVERY
-
-# ============================================================
-
-async def try_asset(qx, candidate):
+    )
 
     try:
 
-        asset_name, info = await qx.get_available_asset(
+        response = requests.post(
 
-            candidate,
+            url,
 
-            force_open=True,
+            json=payload or {},
 
-        )
-
-        if info and len(info) > 2:
-
-            is_open = bool(info[2])
-
-            if is_open:
-
-                return asset_name, True
-
-    except Exception as e:
-
-        print(
-
-            f"Asset check failed "
-
-            f"{candidate}: {e}"
+            timeout=20
 
         )
 
-    return None, False
-
-async def get_open_asset(qx, base):
-
-    group = ASSET_GROUPS.get(base)
-
-    if not group:
-
-        return None, 0
-
-    # -----------------------------------------
-
-    # NORMAL
-
-    # -----------------------------------------
-
-    for candidate in group["normal"]:
-
-        asset, opened = await try_asset(
-
-            qx,
-
-            candidate,
-
-        )
-
-        if opened:
-
-            return asset, 0
-
-    # -----------------------------------------
-
-    # OTC
-
-    # -----------------------------------------
-
-    for candidate in group["otc"]:
-
-        asset, opened = await try_asset(
-
-            qx,
-
-            candidate,
-
-        )
-
-        if opened:
-
-            return asset, 1
-
-    return None, 0
-
-# ============================================================
-
-# INDICATORS
-
-# ============================================================
-
-def ema(series, period):
-
-    return series.ewm(
-
-        span=period,
-
-        adjust=False,
-
-    ).mean()
-
-def rsi_calc(series, period=14):
-
-    delta = series.diff()
-
-    gain = delta.clip(lower=0)
-
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.ewm(
-
-        alpha=1 / period,
-
-        adjust=False,
-
-    ).mean()
-
-    avg_loss = loss.ewm(
-
-        alpha=1 / period,
-
-        adjust=False,
-
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(
-
-        0,
-
-        float("nan"),
-
-    )
-
-    rsi = 100 - (
-
-        100 / (1 + rs)
-
-    )
-
-    # Handle zero-loss / zero-gain cases
-
-    rsi = rsi.mask(
-
-        (avg_loss == 0) & (avg_gain > 0),
-
-        100,
-
-    )
-
-    rsi = rsi.mask(
-
-        (avg_gain == 0) & (avg_loss > 0),
-
-        0,
-
-    )
-
-    return rsi
-
-def atr_calc(df, period=14):
-
-    high_low = (
-
-        df["high"] - df["low"]
-
-    )
-
-    high_close = (
-
-        df["high"]
-
-        - df["close"].shift(1)
-
-    ).abs()
-
-    low_close = (
-
-        df["low"]
-
-        - df["close"].shift(1)
-
-    ).abs()
-
-    true_range = pd.concat(
-
-        [
-
-            high_low,
-
-            high_close,
-
-            low_close,
-
-        ],
-
-        axis=1,
-
-    ).max(axis=1)
-
-    return true_range.rolling(
-
-        period
-
-    ).mean()
-
-# ============================================================
-
-# CANDLE FETCH
-
-# ============================================================
-
-async def get_candles_safe(
-
-    qx,
-
-    asset,
-
-    count=120,
-
-):
-
-    try:
-
-        return await qx.get_candles(
-
-            asset,
-
-            time.time(),
-
-            PERIOD * count,
-
-            PERIOD,
-
-            timeout=15,
-
-            use_cache=False,
-
-        )
-
-    except TypeError:
-
-        try:
-
-            return await qx.get_candles(
-
-                asset,
-
-                time.time(),
-
-                PERIOD * count,
-
-                PERIOD,
-
-            )
-
-        except Exception as e:
+        if not response.ok:
 
             print(
 
-                f"get_candles error "
+                "Telegram HTTP ERROR:",
 
-                f"{asset}: {e}"
+                response.status_code,
+
+                response.text[:500]
 
             )
 
             return None
 
+        data = response.json()
+
+        if not data.get("ok"):
+
+            print(
+
+                "Telegram API ERROR:",
+
+                data
+
+            )
+
+            return None
+
+        return data
+
     except Exception as e:
 
         print(
 
-            f"get_candles error "
+            "Telegram REQUEST ERROR:",
 
-            f"{asset}: {e}"
-
-        )
-
-        return None
-
-def candles_to_df(candles):
-
-    if not candles:
-
-        return None
-
-    df = pd.DataFrame(candles)
-
-    if "time" not in df.columns:
-
-        return None
-
-    for col in [
-
-        "open",
-
-        "close",
-
-        "high",
-
-        "low",
-
-    ]:
-
-        if col not in df.columns:
-
-            return None
-
-        df[col] = pd.to_numeric(
-
-            df[col],
-
-            errors="coerce",
+            repr(e)
 
         )
 
-    df["time"] = df["time"].apply(
+        return None
 
-        normalize_qx_ts
+def send_telegram(text):
+
+    if not CHAT_ID:
+
+        print("Telegram: CHAT_ID missing")
+
+        return False
+
+    result = telegram_api(
+
+        "sendMessage",
+
+        {
+
+            "chat_id": CHAT_ID,
+
+            "text": text,
+
+            "parse_mode": "HTML",
+
+            "disable_web_page_preview": True,
+
+        }
 
     )
 
-    df = df.dropna(
+    return result is not None
 
-        subset=[
+def verify_telegram():
 
-            "time",
+    global telegram_status
 
-            "open",
+    global telegram_bot_username
 
-            "close",
+    print("Telegram: checking BOT_TOKEN...")
 
-            "high",
+    if not BOT_TOKEN:
 
-            "low",
+        telegram_status = "TOKEN_MISSING"
 
-        ]
+        print("ERROR: BOT_TOKEN is missing")
 
-    )
+        return False
 
-    df = (
+    result = telegram_api("getMe")
 
-        df.sort_values("time")
+    if not result:
 
-        .drop_duplicates(
+        telegram_status = "TOKEN_INVALID_OR_NETWORK_ERROR"
 
-            "time",
+        print(
 
-            keep="last",
+            "ERROR: Telegram token could not be verified"
 
         )
 
-        .reset_index(drop=True)
+        return False
+
+    user = result["result"]
+
+    telegram_bot_username = (
+
+        user.get("username") or ""
 
     )
 
-    return df
-
-# ============================================================
-
-# ANALYSIS
-
-# ============================================================
-
-async def analyze_pair(
-
-    qx,
-
-    asset,
-
-    analysis_ts,
-
-):
-
-    candles = await get_candles_safe(
-
-        qx,
-
-        asset,
-
-        count=120,
-
-    )
-
-    df = candles_to_df(candles)
-
-    if df is None:
-
-        return None
-
-    df = df[
-
-        df["time"] <= analysis_ts
-
-    ].copy()
-
-    if len(df) < 60:
-
-        return None
-
-    if int(df.iloc[-1]["time"]) != int(
-
-        analysis_ts
-
-    ):
-
-        return None
-
-    df["ema14"] = ema(
-
-        df["close"],
-
-        14,
-
-    )
-
-    df["ema50"] = ema(
-
-        df["close"],
-
-        50,
-
-    )
-
-    df["rsi"] = rsi_calc(
-
-        df["close"],
-
-        14,
-
-    )
-
-    df["mom"] = (
-
-        df["close"]
-
-        - df["close"].shift(10)
-
-    )
-
-    df["atr"] = atr_calc(
-
-        df,
-
-        14,
-
-    )
-
-    last = df.iloc[-1]
-
-    if any(
-
-        pd.isna(last[x])
-
-        for x in [
-
-            "ema14",
-
-            "ema50",
-
-            "rsi",
-
-            "mom",
-
-            "atr",
-
-        ]
-
-    ):
-
-        return None
-
-    atr = float(last["atr"])
-
-    if atr <= 0:
-
-        return None
-
-    ema_distance = abs(
-
-        float(last["ema14"])
-
-        - float(last["ema50"])
-
-    )
-
-    if (
-
-        ema_distance > atr * 0.30
-
-        and 40 < float(last["rsi"]) < 60
-
-    ):
-
-        confidence = "HIGH"
-
-    elif ema_distance > atr * 0.15:
-
-        confidence = "MEDIUM"
-
-    else:
-
-        confidence = "LOW"
-
-    if confidence == "LOW":
-
-        return None
-
-    recent = df.iloc[-14:-2]
-
-    if recent.empty:
-
-        return None
-
-    resistance = float(
-
-        recent["high"].max()
-
-    )
-
-    support = float(
-
-        recent["low"].min()
-
-    )
-
-    close = float(last["close"])
-
-    ema14 = float(last["ema14"])
-
-    ema50 = float(last["ema50"])
-
-    rsi = float(last["rsi"])
-
-    momentum = float(last["mom"])
-
-    signal = None
-
-    # CALL
-
-    if (
-
-        close > ema14 > ema50
-
-        and rsi > 50
-
-        and momentum > 0
-
-        and close > resistance
-
-    ):
-
-        signal = "CALL"
-
-    # PUT
-
-    elif (
-
-        close < ema14 < ema50
-
-        and rsi < 50
-
-        and momentum < 0
-
-        and close < support
-
-    ):
-
-        signal = "PUT"
-
-    if not signal:
-
-        return None
-
-    return {
-
-        "signal": signal,
-
-        "analysis_close": close,
-
-        "analysis_time": int(
-
-            last["time"]
-
-        ),
-
-        "rsi": rsi,
-
-        "conf": confidence,
-
-        "ema14": ema14,
-
-        "ema50": ema50,
-
-        "atr": atr,
-
-    }
-
-# ============================================================
-
-# ENTRY PRICE
-
-# ============================================================
-
-async def get_entry_price(
-
-    qx,
-
-    asset,
-
-    entry_ts,
-
-):
-
-    candles = await get_candles_safe(
-
-        qx,
-
-        asset,
-
-        count=10,
-
-    )
-
-    df = candles_to_df(candles)
-
-    if df is None:
-
-        return None
-
-    row = df[
-
-        df["time"] == int(entry_ts)
-
-    ]
-
-    if row.empty:
-
-        return None
-
-    candle = row.iloc[-1]
-
-    entry_open = float(
-
-        candle["open"]
-
-    )
-
-    if not math.isfinite(entry_open):
-
-        return None
-
-    return entry_open
-
-# ============================================================
-
-# EXPIRY CANDLE
-
-# ============================================================
-
-async def fetch_expiry_candle(
-
-    qx,
-
-    asset,
-
-    target_ts,
-
-    retries=6,
-
-):
-
-    for attempt in range(
-
-        1,
-
-        retries + 1,
-
-    ):
-
-        try:
-
-            candles = await get_candles_safe(
-
-                qx,
-
-                asset,
-
-                count=20,
-
-            )
-
-            df = candles_to_df(
-
-                candles
-
-            )
-
-            if df is not None:
-
-                row = df[
-
-                    df["time"]
-
-                    == int(target_ts)
-
-                ]
-
-                if not row.empty:
-
-                    return row.iloc[-1].to_dict()
-
-        except Exception as e:
-
-            print(
-
-                "Expiry fetch error:",
-
-                e,
-
-            )
-
-        if attempt < retries:
-
-            await asyncio.sleep(
-
-                2 + attempt * 2
-
-            )
-
-    return None
-
-# ============================================================
-
-# OUTCOME WORKER
-
-# ============================================================
-
-async def outcome_worker_loop():
+    telegram_status = "VERIFIED"
 
     print(
 
-        "Outcome worker v11 started"
+        f"Telegram: token verified "
+
+        f"@{telegram_bot_username}"
 
     )
 
-    qx = await login_qx_safe()
+    if not CHAT_ID:
 
-    while True:
+        print(
 
-        job = None
+            "WARNING: CHAT_ID is missing. "
 
-        try:
+            "Bot commands can still work, "
 
-            job = await asyncio.to_thread(
+            "but automatic signals cannot be sent."
 
-                outcome_queue.get
+        )
 
-            )
+    return True
 
-            (
-
-                asset,
-
-                result,
-
-                signal_id,
-
-                entry_ts,
-
-                expiry_ts,
-
-                expiry_close_ts,
-
-            ) = job
-
-            # Wait until expiry candle is actually closed
-
-            wait = (
-
-                expiry_close_ts + 5
-
-            ) - time.time()
-
-            if wait > 0:
-
-                await asyncio.sleep(
-
-                    wait
-
-                )
-
-            # Reconnect if needed
-
-            if not qx:
-
-                qx = await login_qx_safe()
-
-            else:
-
-                try:
-
-                    connected = (
-
-                        await qx.check_connect()
-
-                    )
-
-                except Exception:
-
-                    connected = False
-
-                if not connected:
-
-                    try:
-
-                        await qx.close()
-
-                    except Exception:
-
-                        pass
-
-                    qx = await login_qx_safe()
-
-            if not qx:
-
-                db_update(
-
-                    signal_id,
-
-                    None,
-
-                    "LOGIN_FAIL",
-
-                )
-
-                continue
-
-            candle = await fetch_expiry_candle(
-
-                qx,
-
-                asset,
-
-                expiry_ts,
-
-            )
-
-            if candle is None:
-
-                db_update(
-
-                    signal_id,
-
-                    None,
-
-                    "FETCH_FAIL",
-
-                )
-
-                send_tg(
-
-                    f"⚠️ RESULT FETCH FAIL\n"
-
-                    f"{asset}\n"
-
-                    f"{result['signal']}\n"
-
-                    f"ID: {signal_id[:8]}"
-
-                )
-
-                continue
-
-            expiry_close = float(
-
-                candle["close"]
-
-            )
-
-            entry_price = float(
-
-                result["entry_price"]
-
-            )
-
-            threshold = get_draw_threshold(
-
-                asset,
-
-                entry_price,
-
-            )
-
-            difference = abs(
-
-                expiry_close
-
-                - entry_price
-
-            )
-
-            if difference <= threshold:
-
-                outcome = "DRAW"
-
-            elif (
-
-                result["signal"] == "CALL"
-
-                and expiry_close > entry_price
-
-            ):
-
-                outcome = "WIN"
-
-            elif (
-
-                result["signal"] == "PUT"
-
-                and expiry_close < entry_price
-
-            ):
-
-                outcome = "WIN"
-
-            else:
-
-                outcome = "LOSS"
-
-            db_update(
-
-                signal_id,
-
-                expiry_close,
-
-                outcome,
-
-            )
-
-            if outcome == "WIN":
-
-                emoji = "✅"
-
-            elif outcome == "LOSS":
-
-                emoji = "❌"
-
-            else:
-
-                emoji = "➖"
-
-            send_tg(
-
-                f"{emoji} RESULT\n"
-
-                f"{asset} {result['signal']}\n"
-
-                f"ID: {signal_id[:8]}\n"
-
-                f"Entry: {entry_price:.8f}\n"
-
-                f"Expiry: {expiry_close:.8f}\n"
-
-                f"Result: {outcome}"
-
-            )
-
-            print(
-
-                f"RESULT {asset} "
-
-                f"{result['signal']} "
-
-                f"{outcome}"
-
-            )
-
-        except Exception as e:
-
-            print(
-
-                "Outcome worker error:",
-
-                e,
-
-            )
-
-            if job:
-
-                try:
-
-                    db_update(
-
-                        job[2],
-
-                        None,
-
-                        "ERROR",
-
-                    )
-
-                except Exception:
-
-                    pass
-
-            await asyncio.sleep(2)
-
-        finally:
-
-            if job is not None:
-
-                try:
-
-                    outcome_queue.task_done()
-
-                except Exception:
-
-                    pass
-
-def outcome_worker_thread():
-
-    asyncio.run(
-
-        outcome_worker_loop()
-
-    )
-
-# ============================================================
-
-# SCANNER
-
-# ============================================================
-
-async def scanner_loop():
-
-    global last_scanned_entry_ts
-
-    print(
-
-        "Scanner v11 started"
-
-    )
-
-    qx = await login_qx_safe()
-
-    while True:
-
-        try:
-
-            if not qx:
-
-                qx = await login_qx_safe()
-
-                if not qx:
-
-                    await asyncio.sleep(30)
-
-                    continue
-
-            try:
-
-                connected = (
-
-                    await qx.check_connect()
-
-                )
-
-            except Exception:
-
-                connected = False
-
-            if not connected:
-
-                try:
-
-                    await qx.close()
-
-                except Exception:
-
-                    pass
-
-                qx = await login_qx_safe()
-
-                if not qx:
-
-                    await asyncio.sleep(30)
-
-                    continue
-
-            cycle = get_next_cycle(
-
-                last_scanned_entry_ts
-
-            )
-
-            analysis_ts = cycle[
-
-                "analysis_ts"
-
-            ]
-
-            entry_ts = cycle[
-
-                "entry_ts"
-
-            ]
-
-            expiry_ts = cycle[
-
-                "expiry_ts"
-
-            ]
-
-            expiry_close_ts = cycle[
-
-                "expiry_close_ts"
-
-            ]
-
-            sleep_sec = cycle[
-
-                "sleep_sec"
-
-            ]
-
-            print(
-
-                f"Next scan "
-
-                f"{utc_dt(entry_ts).strftime('%H:%M:%S')} UTC "
-
-                f"in {sleep_sec:.1f}s"
-
-            )
-
-            if sleep_sec > 0:
-
-                await asyncio.sleep(
-
-                    sleep_sec
-
-                )
-
-            last_scanned_entry_ts = (
-
-                entry_ts
-
-            )
-
-            # -----------------------------------------
-
-            # Scan every requested asset
-
-            # -----------------------------------------
-
-            for base in BASE_PAIRS:
-
-                try:
-
-                    asset, is_otc = (
-
-                        await get_open_asset(
-
-                            qx,
-
-                            base,
-
-                        )
-
-                    )
-
-                    if not asset:
-
-                        print(
-
-                            f"{base}: CLOSED / NOT AVAILABLE"
-
-                        )
-
-                        continue
-
-                    # Analyze the candle that just closed
-
-                    analysis = (
-
-                        await analyze_pair(
-
-                            qx,
-
-                            asset,
-
-                            analysis_ts,
-
-                        )
-
-                    )
-
-                    if not analysis:
-
-                        print(
-
-                            f"{base} {asset}: WAIT"
-
-                        )
-
-                        continue
-
-                    # -----------------------------------------
-
-                    # Get actual next candle open
-
-                    # -----------------------------------------
-
-                    entry_price = (
-
-                        await get_entry_price(
-
-                            qx,
-
-                            asset,
-
-                            entry_ts,
-
-                        )
-
-                    )
-
-                    # Sometimes the candle open is not yet returned
-
-                    # immediately. Use analysis close as fallback.
-
-                    if entry_price is None:
-
-                        entry_price = float(
-
-                            analysis[
-
-                                "analysis_close"
-
-                            ]
-
-                        )
-
-                        entry_price_fallback = True
-
-                    else:
-
-                        entry_price_fallback = False
-
-                    signal = analysis[
-
-                        "signal"
-
-                    ]
-
-                    key = (
-
-                        asset,
-
-                        signal,
-
-                        entry_ts,
-
-                    )
-
-                    if not cache_add(key):
-
-                        continue
-
-                    signal_id = str(
-
-                        uuid.uuid4()
-
-                    )
-
-                    data = {
-
-                        "id": signal_id,
-
-                        "timestamp": datetime.now(
-
-                            timezone.utc
-
-                        ).isoformat(),
-
-                        "asset": asset,
-
-                        "base_asset": base,
-
-                        "is_otc": is_otc,
-
-                        "signal": signal,
-
-                        "entry_price": entry_price,
-
-                        "entry_candle_time": entry_ts,
-
-                        "expiry_candle_time": expiry_ts,
-
-                        "expiry_close": None,
-
-                        "outcome": None,
-
-                        "rsi": analysis["rsi"],
-
-                        "confidence": analysis["conf"],
-
-                    }
-
-                    inserted = db_insert(
-
-                        data
-
-                    )
-
-                    if not inserted:
-
-                        print(
-
-                            f"{base}: DB insert failed"
-
-                        )
-
-                        continue
-
-                    if signal == "CALL":
-
-                        emoji = "🟢"
-
-                    else:
-
-                        emoji = "🔴"
-
-                    otc_text = (
-
-                        " OTC"
-
-                        if is_otc
-
-                        else ""
-
-                    )
-
-                    fallback_text = (
-
-                        "\n⚠️ Entry price fallback"
-
-                        if entry_price_fallback
-
-                        else ""
-
-                    )
-
-                    send_tg(
-
-                        f"{emoji} "
-
-                        f"{signal} "
-
-                        f"{asset}{otc_text}\n"
-
-                        f"ID: {signal_id[:8]}\n"
-
-                        f"Entry: "
-
-                        f"{utc_dt(entry_ts).strftime('%H:%M:%S')} UTC\n"
-
-                        f"Price: {entry_price:.8f}\n"
-
-                        f"RSI: {analysis['rsi']:.1f}\n"
-
-                        f"Confidence: {analysis['conf']}\n"
-
-                        f"Expiry: "
-
-                        f"{utc_dt(expiry_close_ts).strftime('%H:%M:%S')} UTC"
-
-                        f"{fallback_text}"
-
-                    )
-
-                    outcome_queue.put(
-
-                        (
-
-                            asset,
-
-                            {
-
-                                "signal": signal,
-
-                                "entry_price": entry_price,
-
-                                "rsi": analysis["rsi"],
-
-                                "conf": analysis["conf"],
-
-                            },
-
-                            signal_id,
-
-                            entry_ts,
-
-                            expiry_ts,
-
-                            expiry_close_ts,
-
-                        )
-
-                    )
-
-                    print(
-
-                        f"SIGNAL "
-
-                        f"{base} "
-
-                        f"{asset} "
-
-                        f"{signal} "
-
-                        f"{analysis['conf']}"
-
-                    )
-
-                    await asyncio.sleep(
-
-                        0.5
-
-                    )
-
-                except Exception as e:
-
-                    print(
-
-                        f"Pair {base} error:",
-
-                        e,
-
-                    )
-
-                    continue
-
-        except Exception as e:
-
-            print(
-
-                "Scanner error:",
-
-                e,
-
-            )
-
-            try:
-
-                if qx:
-
-                    await qx.close()
-
-            except Exception:
-
-                pass
-
-            qx = None
-
-            await asyncio.sleep(5)
-
-def scanner_thread():
-
-    asyncio.run(
-
-        scanner_loop()
-
-    )
-
-# ============================================================
+# =========================================================
 
 # TELEGRAM COMMANDS
 
-# ============================================================
+# =========================================================
 
-async def start(
+async def cmd_start(
 
     update: Update,
 
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 
 ):
 
-    await update.message.reply_text(
+    text = (
 
-        "🟢 QUOTEX v11 ONLINE\n\n"
+        "✅ <b>Adil SAFE WIN Bot</b>\n\n"
 
-        "Assets:\n"
+        f"Version: <b>{VERSION}</b>\n"
 
-        "• EURUSD\n"
+        "Engine: <b>1 Minute</b>\n"
 
-        "• BTCUSD\n"
-
-        "• XAUUSD / GOLD\n"
-
-        "• Normal + OTC fallback\n\n"
+        "Markets: <b>BTC + EURUSD + GOLD + OTC</b>\n\n"
 
         "Commands:\n"
 
@@ -2372,393 +836,231 @@ async def start(
 
     )
 
-async def status(
-
-    update: Update,
-
-    context: ContextTypes.DEFAULT_TYPE,
-
-):
-
     await update.message.reply_text(
 
-        "🟢 QUOTEX v11 ONLINE\n"
+        text,
 
-        f"Outcome Queue: "
-
-        f"{outcome_queue.qsize()}\n"
-
-        f"Assets: {', '.join(BASE_PAIRS)}"
+        parse_mode="HTML"
 
     )
 
-async def market(
+async def cmd_status(
 
     update: Update,
 
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 
 ):
 
-    await update.message.reply_text(
+    text = (
 
-        "⏳ Checking market..."
+        "📊 <b>BOT STATUS</b>\n\n"
+
+        f"Telegram: <b>{telegram_status}</b>\n"
+
+        f"Quotex: <b>{quotex_status}</b>\n"
+
+        f"Version: <b>{VERSION}</b>\n"
+
+        f"Pending outcomes: <b>{len(pending_outcomes)}</b>"
 
     )
 
-    cycle = get_next_cycle(None)
+    await update.message.reply_text(
 
-    analysis_ts = cycle[
+        text,
 
-        "analysis_ts"
+        parse_mode="HTML"
 
-    ]
+    )
 
-    qx = await login_qx_safe()
+async def cmd_market(
 
-    if not qx:
+    update: Update,
 
-        await update.message.reply_text(
+    context: ContextTypes.DEFAULT_TYPE
 
-            "❌ Quotex login failed"
+):
 
-        )
+    text = (
+
+        "📈 <b>MARKETS</b>\n\n"
+
+        "🪙 BTCUSD\n"
+
+        "💱 EURUSD\n"
+
+        "🥇 XAUUSD / GOLD\n\n"
+
+        "OTC symbols bhi scanner mein included hain."
+
+    )
+
+    await update.message.reply_text(
+
+        text,
+
+        parse_mode="HTML"
+
+    )
+
+async def cmd_stats(
+
+    update: Update,
+
+    context: ContextTypes.DEFAULT_TYPE
+
+):
+
+    total, wins, losses, draws, pending = db_stats()
+
+    completed = wins + losses + draws
+
+    if completed:
+
+        winrate = (
+
+            wins / completed
+
+        ) * 100
+
+    else:
+
+        winrate = 0
+
+    text = (
+
+        "📊 <b>STATISTICS</b>\n\n"
+
+        f"Total: <b>{total}</b>\n"
+
+        f"WIN: <b>{wins}</b>\n"
+
+        f"LOSS: <b>{losses}</b>\n"
+
+        f"DRAW: <b>{draws}</b>\n"
+
+        f"PENDING: <b>{pending}</b>\n\n"
+
+        f"Completed win rate: "
+
+        f"<b>{winrate:.1f}%</b>"
+
+    )
+
+    await update.message.reply_text(
+
+        text,
+
+        parse_mode="HTML"
+
+    )
+
+async def telegram_main():
+
+    global telegram_status
+
+    print("Telegram: initializing...")
+
+    if not verify_telegram():
 
         return
 
     try:
 
-        lines = [
+        application = (
 
-            "📊 QUOTEX v11 MARKET",
+            ApplicationBuilder()
 
-            "",
+            .token(BOT_TOKEN)
 
-            "Analysis: "
+            .build()
 
-            + utc_dt(
+        )
 
-                analysis_ts
+        application.add_handler(
 
-            ).strftime(
+            CommandHandler(
 
-                "%H:%M:%S"
+                "start",
+
+                cmd_start
 
             )
 
-            + " UTC",
-
-        ]
-
-        for base in BASE_PAIRS:
-
-            try:
-
-                asset, is_otc = (
-
-                    await get_open_asset(
-
-                        qx,
-
-                        base,
-
-                    )
-
-                )
-
-                if not asset:
-
-                    lines.append(
-
-                        f"⚪ {base}: CLOSED"
-
-                    )
-
-                    continue
-
-                result = await analyze_pair(
-
-                    qx,
-
-                    asset,
-
-                    analysis_ts,
-
-                )
-
-                otc_text = (
-
-                    " OTC"
-
-                    if is_otc
-
-                    else ""
-
-                )
-
-                if result:
-
-                    emoji = (
-
-                        "🟢"
-
-                        if result["signal"]
-
-                        == "CALL"
-
-                        else "🔴"
-
-                    )
-
-                    lines.append(
-
-                        f"{emoji} "
-
-                        f"{asset}{otc_text}: "
-
-                        f"{result['signal']} "
-
-                        f"[{result['conf']}]"
-
-                    )
-
-                else:
-
-                    lines.append(
-
-                        f"⚪ "
-
-                        f"{asset}{otc_text}: WAIT"
-
-                    )
-
-            except Exception as e:
-
-                lines.append(
-
-                    f"⚠️ {base}: ERROR"
-
-                )
-
-                print(
-
-                    f"Market {base} error:",
-
-                    e,
-
-                )
-
-        await update.message.reply_text(
-
-            "\n".join(lines)
-
         )
 
-    finally:
+        application.add_handler(
 
-        try:
+            CommandHandler(
 
-            await qx.close()
+                "status",
 
-        except Exception:
-
-            pass
-
-async def stats_cmd(
-
-    update: Update,
-
-    context: ContextTypes.DEFAULT_TYPE,
-
-):
-
-    try:
-
-        stats = await asyncio.to_thread(
-
-            db_stats
-
-        )
-
-        total, wins, rate = stats[
-
-            "ALL"
-
-        ]
-
-        if total == 0:
-
-            await update.message.reply_text(
-
-                "📊 No WIN/LOSS results yet."
+                cmd_status
 
             )
 
-            return
-
-        msg = (
-
-            "📊 QUOTEX v11 STATS\n\n"
-
-            f"Overall: "
-
-            f"{wins}/{total} "
-
-            f"= {rate:.1f}%\n"
-
         )
 
-        for pair in BASE_PAIRS:
+        application.add_handler(
 
-            t, w, r = stats[pair]
+            CommandHandler(
 
-            msg += (
+                "market",
 
-                f"{pair}: "
-
-                f"{w}/{t} = {r:.1f}%\n"
+                cmd_market
 
             )
 
-        t, w, r = stats["NORMAL"]
-
-        msg += (
-
-            f"\nNORMAL: "
-
-            f"{w}/{t} = {r:.1f}%\n"
-
         )
 
-        t, w, r = stats["OTC"]
+        application.add_handler(
 
-        msg += (
+            CommandHandler(
 
-            f"OTC: "
+                "stats",
 
-            f"{w}/{t} = {r:.1f}%\n"
+                cmd_stats
 
-        )
-
-        t, w, r = stats["CALL"]
-
-        msg += (
-
-            f"\nCALL: "
-
-            f"{w}/{t} = {r:.1f}%\n"
+            )
 
         )
-
-        t, w, r = stats["PUT"]
-
-        msg += (
-
-            f"PUT: "
-
-            f"{w}/{t} = {r:.1f}%"
-
-        )
-
-        await update.message.reply_text(
-
-            msg
-
-        )
-
-    except Exception as e:
 
         print(
 
-            "Stats error:",
-
-            e,
+            "Telegram: application initializing..."
 
         )
 
-        await update.message.reply_text(
+        await application.initialize()
 
-            "❌ Stats error"
+        print(
 
-        )
-
-# ============================================================
-
-# TELEGRAM BOT
-
-# ============================================================
-
-async def telegram_main():
-
-    application = (
-
-        ApplicationBuilder()
-
-        .token(BOT_TOKEN)
-
-        .build()
-
-    )
-
-    application.add_handler(
-
-        CommandHandler(
-
-            "start",
-
-            start,
+            "Telegram: application initialized"
 
         )
 
-    )
+        await application.start()
 
-    application.add_handler(
+        print(
 
-        CommandHandler(
-
-            "status",
-
-            status,
+            "Telegram: application started"
 
         )
 
-    )
+        if application.updater is None:
 
-    application.add_handler(
+            raise RuntimeError(
 
-        CommandHandler(
+                "Telegram updater is unavailable"
 
-            "market",
+            )
 
-            market,
+        print(
 
-        )
-
-    )
-
-    application.add_handler(
-
-        CommandHandler(
-
-            "stats",
-
-            stats_cmd,
+            "Telegram: starting polling..."
 
         )
-
-    )
-
-    print(
-
-        "Telegram bot initializing..."
-
-    )
-
-    await application.initialize()
-
-    await application.start()
-
-    if application.updater:
 
         await application.updater.start_polling(
 
@@ -2766,43 +1068,51 @@ async def telegram_main():
 
         )
 
-    print(
-
-        "Telegram bot LIVE"
-
-    )
-
-    try:
-
-        while True:
-
-            await asyncio.sleep(
-
-                3600
-
-            )
-
-    finally:
-
-        if application.updater:
-
-            await application.updater.stop()
-
-        await application.stop()
-
-        await application.shutdown()
-
-def run_bot():
-
-    if not BOT_TOKEN:
+        telegram_status = "LIVE"
 
         print(
 
-            "ERROR: BOT_TOKEN missing"
+            f"Telegram bot LIVE "
+
+            f"@{telegram_bot_username}"
 
         )
 
-        return
+        while True:
+
+            await asyncio.sleep(3600)
+
+    except Exception as e:
+
+        telegram_status = "ERROR"
+
+        print(
+
+            "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+
+        )
+
+        print(
+
+            "TELEGRAM THREAD ERROR"
+
+        )
+
+        print(
+
+            repr(e)
+
+        )
+
+        traceback.print_exc()
+
+        print(
+
+            "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+
+        )
+
+def telegram_thread():
 
     try:
 
@@ -2816,19 +1126,1325 @@ def run_bot():
 
         print(
 
-            "Telegram thread crashed:",
+            "Telegram asyncio ERROR:",
 
-            e,
+            repr(e)
 
         )
 
-# ============================================================
+        traceback.print_exc()
 
-# MAIN
+# =========================================================
 
-# ============================================================
+# INDICATORS
 
-if __name__ == "__main__":
+# =========================================================
+
+def rsi(series, period=14):
+
+    delta = series.diff()
+
+    gain = delta.clip(
+
+        lower=0
+
+    )
+
+    loss = -delta.clip(
+
+        upper=0
+
+    )
+
+    avg_gain = gain.rolling(
+
+        period
+
+    ).mean()
+
+    avg_loss = loss.rolling(
+
+        period
+
+    ).mean()
+
+    rs = (
+
+        avg_gain /
+
+        avg_loss.replace(
+
+            0,
+
+            np.nan
+
+        )
+
+    )
+
+    result = 100 - (
+
+        100 / (1 + rs)
+
+    )
+
+    result = result.where(
+
+        ~(
+
+            (avg_loss == 0) &
+
+            (avg_gain > 0)
+
+        ),
+
+        100
+
+    )
+
+    result = result.where(
+
+        ~(
+
+            (avg_gain == 0) &
+
+            (avg_loss > 0)
+
+        ),
+
+        0
+
+    )
+
+    return result
+
+def atr(df, period=14):
+
+    previous_close = df["close"].shift(1)
+
+    tr = pd.concat(
+
+        [
+
+            df["high"] - df["low"],
+
+            (
+
+                df["high"] -
+
+                previous_close
+
+            ).abs(),
+
+            (
+
+                df["low"] -
+
+                previous_close
+
+            ).abs(),
+
+        ],
+
+        axis=1
+
+    ).max(axis=1)
+
+    return tr.rolling(
+
+        period
+
+    ).mean()
+
+# =========================================================
+
+# QUOTEX CANDLE HELPERS
+
+# =========================================================
+
+def normalize_candles(raw):
+
+    if raw is None:
+
+        return None
+
+    # Some versions can return dict
+
+    if isinstance(raw, dict):
+
+        if "data" in raw:
+
+            raw = raw["data"]
+
+        elif "candles" in raw:
+
+            raw = raw["candles"]
+
+        else:
+
+            raw = [raw]
+
+    if not isinstance(raw, list):
+
+        return None
+
+    rows = []
+
+    for item in raw:
+
+        if not isinstance(item, dict):
+
+            continue
+
+        try:
+
+            t = (
+
+                item.get("time")
+
+                or item.get("from")
+
+                or item.get("timestamp")
+
+            )
+
+            o = item.get("open")
+
+            h = item.get("high")
+
+            l = item.get("low")
+
+            c = item.get("close")
+
+            # Some Quotex responses use max/min
+
+            if h is None:
+
+                h = item.get("max")
+
+            if l is None:
+
+                l = item.get("min")
+
+            if (
+
+                t is None or
+
+                o is None or
+
+                h is None or
+
+                l is None or
+
+                c is None
+
+            ):
+
+                continue
+
+            rows.append({
+
+                "time": int(float(t)),
+
+                "open": float(o),
+
+                "high": float(h),
+
+                "low": float(l),
+
+                "close": float(c),
+
+            })
+
+        except Exception:
+
+            continue
+
+    if len(rows) < 20:
+
+        return None
+
+    df = pd.DataFrame(rows)
+
+    df = df.drop_duplicates(
+
+        subset=["time"]
+
+    )
+
+    df = df.sort_values(
+
+        "time"
+
+    )
+
+    return df.reset_index(
+
+        drop=True
+
+    )
+
+async def get_candles_async(
+
+    client,
+
+    symbol
+
+):
+
+    try:
+
+        end_time = time.time()
+
+        offset = 3600
+
+        raw = await client.get_candles(
+
+            symbol,
+
+            end_time,
+
+            offset,
+
+            PERIOD
+
+        )
+
+        return normalize_candles(raw)
+
+    except Exception as e:
+
+        print(
+
+            f"Candle ERROR [{symbol}]:",
+
+            repr(e)
+
+        )
+
+        return None
+
+# =========================================================
+
+# ANALYSIS
+
+# =========================================================
+
+def analyze(df):
+
+    if df is None:
+
+        return None
+
+    if len(df) < 60:
+
+        return None
+
+    data = df.copy()
+
+    data["ema14"] = (
+
+        data["close"]
+
+        .ewm(
+
+            span=14,
+
+            adjust=False
+
+        )
+
+        .mean()
+
+    )
+
+    data["ema50"] = (
+
+        data["close"]
+
+        .ewm(
+
+            span=50,
+
+            adjust=False
+
+        )
+
+        .mean()
+
+    )
+
+    data["rsi"] = rsi(
+
+        data["close"],
+
+        14
+
+    )
+
+    data["atr"] = atr(
+
+        data,
+
+        14
+
+    )
+
+    # Last completed candle
+
+    last = data.iloc[-2]
+
+    previous = data.iloc[-3]
+
+    score_call = 0
+
+    score_put = 0
+
+    # EMA
+
+    if last["ema14"] > last["ema50"]:
+
+        score_call += 2
+
+    elif last["ema14"] < last["ema50"]:
+
+        score_put += 2
+
+    # RSI
+
+    if 52 <= last["rsi"] <= 68:
+
+        score_call += 2
+
+    elif 32 <= last["rsi"] <= 48:
+
+        score_put += 2
+
+    # Momentum
+
+    if last["close"] > previous["close"]:
+
+        score_call += 1
+
+    elif last["close"] < previous["close"]:
+
+        score_put += 1
+
+    # Candle
+
+    if last["close"] > last["open"]:
+
+        score_call += 1
+
+    elif last["close"] < last["open"]:
+
+        score_put += 1
+
+    # Recent breakout
+
+    recent = data.iloc[-7:-2]
+
+    if len(recent):
+
+        recent_high = recent["high"].max()
+
+        recent_low = recent["low"].min()
+
+        if last["close"] > recent_high:
+
+            score_call += 2
+
+        elif last["close"] < recent_low:
+
+            score_put += 2
+
+    if score_call == score_put:
+
+        return None
+
+    if score_call > score_put:
+
+        direction = "CALL"
+
+        score = score_call
+
+    else:
+
+        direction = "PUT"
+
+        score = score_put
+
+    confidence = min(
+
+        95,
+
+        50 + score * 5
+
+    )
+
+    return {
+
+        "direction": direction,
+
+        "confidence": confidence,
+
+        "analysis_close": float(
+
+            last["close"]
+
+        ),
+
+        "analysis_time": int(
+
+            last["time"]
+
+        ),
+
+    }
+
+# =========================================================
+
+# ASSET TEST
+
+# =========================================================
+
+async def find_working_asset(
+
+    client,
+
+    base_name
+
+):
+
+    candidates = ASSETS.get(
+
+        base_name,
+
+        []
+
+    )
+
+    for symbol in candidates:
+
+        try:
+
+            df = await get_candles_async(
+
+                client,
+
+                symbol
+
+            )
+
+            if df is not None and len(df) >= 60:
+
+                print(
+
+                    f"ASSET OK: "
+
+                    f"{base_name} -> {symbol}"
+
+                )
+
+                return symbol, df
+
+            print(
+
+                f"ASSET NO DATA: {symbol}"
+
+            )
+
+        except Exception as e:
+
+            print(
+
+                f"ASSET ERROR {symbol}:",
+
+                repr(e)
+
+            )
+
+    return None, None
+
+# =========================================================
+
+# SIGNAL
+
+# =========================================================
+
+async def generate_signal(
+
+    client,
+
+    base_name
+
+):
+
+    symbol, df = await find_working_asset(
+
+        client,
+
+        base_name
+
+    )
+
+    if symbol is None:
+
+        return
+
+    result = analyze(df)
+
+    if result is None:
+
+        return
+
+    # Current candle = entry candle
+
+    current_candle = df.iloc[-1]
+
+    entry = float(
+
+        current_candle["open"]
+
+    )
+
+    entry_time = int(
+
+        current_candle["time"]
+
+    )
+
+    analysis_time = int(
+
+        result["analysis_time"]
+
+    )
+
+    # Avoid duplicate candle signal
+
+    memory_key = (
+
+        base_name,
+
+        symbol,
+
+        entry_time
+
+    )
+
+    if memory_key in signal_memory:
+
+        return
+
+    signal_memory[memory_key] = True
+
+    direction = result["direction"]
+
+    confidence = result["confidence"]
+
+    analysis_close = result[
+
+        "analysis_close"
+
+    ]
+
+    # Expiry = one minute
+
+    expiry_time = (
+
+        entry_time + PERIOD
+
+    )
+
+    signal_text = (
+
+        "🚨 <b>1 MIN SIGNAL</b>\n\n"
+
+        f"📊 Asset: <b>{symbol}</b>\n"
+
+        f"🎯 Direction: "
+
+        f"<b>{direction}</b>\n"
+
+        f"💰 Entry: <b>{entry:.8f}</b>\n"
+
+        f"📈 Confidence: "
+
+        f"<b>{confidence:.0f}%</b>\n"
+
+        f"⏱ Expiry: <b>1 MIN</b>\n\n"
+
+        "⚠️ Confidence is a technical score, "
+
+        "not a guaranteed win probability."
+
+    )
+
+    print(
+
+        f"SIGNAL | {symbol} | "
+
+        f"{direction} | "
+
+        f"Entry={entry} | "
+
+        f"Confidence={confidence:.0f}%"
+
+    )
+
+    # Database
+
+    db_insert(
+
+        asset=symbol,
+
+        direction=direction,
+
+        confidence=confidence,
+
+        entry=entry,
+
+        analysis_close=analysis_close,
+
+        analysis_time=datetime.fromtimestamp(
+
+            analysis_time,
+
+            timezone.utc
+
+        ),
+
+        entry_time=datetime.fromtimestamp(
+
+            entry_time,
+
+            timezone.utc
+
+        ),
+
+        expiry_time=datetime.fromtimestamp(
+
+            expiry_time,
+
+            timezone.utc
+
+        )
+
+    )
+
+    # Telegram
+
+    send_telegram(
+
+        signal_text
+
+    )
+
+    # Queue outcome
+
+    with pending_lock:
+
+        pending_outcomes.append({
+
+            "asset": symbol,
+
+            "direction": direction,
+
+            "entry": entry,
+
+            "entry_time": entry_time,
+
+            "expiry_time": expiry_time,
+
+        })
+
+# =========================================================
+
+# OUTCOME
+
+# =========================================================
+
+async def process_outcomes(
+
+    client
+
+):
+
+    now = int(
+
+        time.time()
+
+    )
+
+    due = []
+
+    with pending_lock:
+
+        for item in pending_outcomes:
+
+            if now >= (
+
+                item["expiry_time"] + 5
+
+            ):
+
+                due.append(item)
+
+    for item in due:
+
+        symbol = item["asset"]
+
+        try:
+
+            df = await get_candles_async(
+
+                client,
+
+                symbol
+
+            )
+
+            if df is None:
+
+                print(
+
+                    "Outcome: no candle",
+
+                    symbol
+
+                )
+
+                continue
+
+            target = None
+
+            expiry_time = item[
+
+                "expiry_time"
+
+            ]
+
+            # Find expiry candle
+
+            for _, candle in df.iterrows():
+
+                candle_time = int(
+
+                    candle["time"]
+
+                )
+
+                if candle_time >= expiry_time:
+
+                    target = candle
+
+                    break
+
+            if target is None:
+
+                print(
+
+                    "Outcome: target candle "
+
+                    "not available:",
+
+                    symbol
+
+                )
+
+                continue
+
+            expiry_close = float(
+
+                target["close"]
+
+            )
+
+            entry = float(
+
+                item["entry"]
+
+            )
+
+            direction = item[
+
+                "direction"
+
+            ]
+
+            # Small movement = DRAW
+
+            difference = abs(
+
+                expiry_close - entry
+
+            )
+
+            threshold = max(
+
+                abs(entry) * 0.00003,
+
+                0.00000001
+
+            )
+
+            if difference <= threshold:
+
+                result = "DRAW"
+
+            elif direction == "CALL":
+
+                result = (
+
+                    "WIN"
+
+                    if expiry_close > entry
+
+                    else "LOSS"
+
+                )
+
+            else:
+
+                result = (
+
+                    "WIN"
+
+                    if expiry_close < entry
+
+                    else "LOSS"
+
+                )
+
+            entry_dt = datetime.fromtimestamp(
+
+                item["entry_time"],
+
+                timezone.utc
+
+            )
+
+            db_update(
+
+                asset=symbol,
+
+                entry_time=entry_dt,
+
+                expiry_close=expiry_close,
+
+                result=result
+
+            )
+
+            emoji = {
+
+                "WIN": "✅",
+
+                "LOSS": "❌",
+
+                "DRAW": "➖",
+
+            }.get(
+
+                result,
+
+                "ℹ️"
+
+            )
+
+            text = (
+
+                f"{emoji} <b>RESULT</b>\n\n"
+
+                f"📊 {symbol}\n"
+
+                f"🎯 {direction}\n"
+
+                f"Entry: <b>{entry:.8f}</b>\n"
+
+                f"Close: <b>{expiry_close:.8f}</b>\n"
+
+                f"Result: <b>{result}</b>"
+
+            )
+
+            print(
+
+                f"RESULT | {symbol} | "
+
+                f"{direction} | "
+
+                f"{result}"
+
+            )
+
+            send_telegram(
+
+                text
+
+            )
+
+            with pending_lock:
+
+                if item in pending_outcomes:
+
+                    pending_outcomes.remove(
+
+                        item
+
+                    )
+
+        except Exception as e:
+
+            print(
+
+                "OUTCOME ERROR:",
+
+                repr(e)
+
+            )
+
+            traceback.print_exc()
+
+# =========================================================
+
+# QUOTEX ENGINE
+
+# =========================================================
+
+async def quotex_engine():
+
+    global quotex_client
+
+    global quotex_status
+
+    if not QUOTEX_EMAIL:
+
+        quotex_status = "EMAIL_MISSING"
+
+        print(
+
+            "ERROR: QUOTEX_EMAIL missing"
+
+        )
+
+        return
+
+    if not QUOTEX_PASSWORD:
+
+        quotex_status = "PASSWORD_MISSING"
+
+        print(
+
+            "ERROR: QUOTEX_PASSWORD missing"
+
+        )
+
+        return
+
+    print(
+
+        "Quotex: creating client..."
+
+    )
+
+    try:
+
+        client = Quotex(
+
+            email=QUOTEX_EMAIL,
+
+            password=QUOTEX_PASSWORD,
+
+            lang="en",
+
+            user_data_dir="browser",
+
+        )
+
+        quotex_client = client
+
+        print(
+
+            "Quotex: client created"
+
+        )
+
+    except Exception as e:
+
+        quotex_status = "CLIENT_ERROR"
+
+        print(
+
+            "QUOTEX CLIENT ERROR:",
+
+            repr(e)
+
+        )
+
+        traceback.print_exc()
+
+        return
+
+    while True:
+
+        try:
+
+            print(
+
+                "Quotex: connecting..."
+
+            )
+
+            connected, reason = (
+
+                await client.connect()
+
+            )
+
+            print(
+
+                "Quotex connect response:",
+
+                connected,
+
+                reason
+
+            )
+
+            if not connected:
+
+                quotex_status = "LOGIN_FAILED"
+
+                print(
+
+                    "Quotex: connection failed:",
+
+                    reason
+
+                )
+
+                await asyncio.sleep(
+
+                    15
+
+                )
+
+                continue
+
+            quotex_status = "CONNECTED"
+
+            print(
+
+                "=========================================="
+
+            )
+
+            print(
+
+                "QUOTEX CONNECTED"
+
+            )
+
+            print(
+
+                "Signal scanner is LIVE"
+
+            )
+
+            print(
+
+                "=========================================="
+
+            )
+
+            # Initial test
+
+            test_symbol, test_df = (
+
+                await find_working_asset(
+
+                    client,
+
+                    "EURUSD"
+
+                )
+
+            )
+
+            if test_symbol:
+
+                print(
+
+                    f"Quotex candle test OK: "
+
+                    f"{test_symbol} "
+
+                    f"{len(test_df)} candles"
+
+                )
+
+            else:
+
+                print(
+
+                    "WARNING: EURUSD candle test "
+
+                    "returned no data"
+
+                )
+
+            # Main scanner
+
+            while True:
+
+                try:
+
+                    connected_now = (
+
+                        await client.check_connect()
+
+                    )
+
+                    if not connected_now:
+
+                        print(
+
+                            "Quotex disconnected. "
+
+                            "Reconnecting..."
+
+                        )
+
+                        quotex_status = (
+
+                            "RECONNECTING"
+
+                        )
+
+                        break
+
+                    for base_name in ASSETS:
+
+                        try:
+
+                            await generate_signal(
+
+                                client,
+
+                                base_name
+
+                            )
+
+                        except Exception as e:
+
+                            print(
+
+                                f"Scanner error "
+
+                                f"{base_name}:",
+
+                                repr(e)
+
+                            )
+
+                            traceback.print_exc()
+
+                    await process_outcomes(
+
+                        client
+
+                    )
+
+                    await asyncio.sleep(
+
+                        SCAN_DELAY
+
+                    )
+
+                except Exception as e:
+
+                    print(
+
+                        "Scanner loop ERROR:",
+
+                        repr(e)
+
+                    )
+
+                    traceback.print_exc()
+
+                    await asyncio.sleep(
+
+                        10
+
+                    )
+
+        except Exception as e:
+
+            quotex_status = "ERROR"
+
+            print(
+
+                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+
+            )
+
+            print(
+
+                "QUOTEX ENGINE ERROR"
+
+            )
+
+            print(
+
+                repr(e)
+
+            )
+
+            traceback.print_exc()
+
+            print(
+
+                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+
+            )
+
+            await asyncio.sleep(
+
+                15
+
+            )
+
+def quotex_thread():
+
+    try:
+
+        asyncio.run(
+
+            quotex_engine()
+
+        )
+
+    except Exception as e:
+
+        print(
+
+            "Quotex asyncio ERROR:",
+
+            repr(e)
+
+        )
+
+        traceback.print_exc()
+
+# =========================================================
+
+# STARTUP
+
+# =========================================================
+
+def print_config_status():
 
     print(
 
@@ -2838,7 +2454,7 @@ if __name__ == "__main__":
 
     print(
 
-        "QUOTEX v11 FULL UPGRADE"
+        f"QUOTEX SIGNAL BOT {VERSION}"
 
     )
 
@@ -2856,13 +2472,19 @@ if __name__ == "__main__":
 
     print(
 
-        "Telegram asyncio FIXED"
+        "Telegram diagnostic FIXED"
 
     )
 
     print(
 
-        "PostgreSQL / SQLite FIXED"
+        "Quotex async engine FIXED"
+
+    )
+
+    print(
+
+        "PostgreSQL / SQLite"
 
     )
 
@@ -2872,57 +2494,101 @@ if __name__ == "__main__":
 
     )
 
-    # Scanner
+    print(
 
-    threading.Thread(
+        "BOT_TOKEN:",
 
-        target=scanner_thread,
-
-        name="Scanner",
-
-        daemon=True,
-
-    ).start()
-
-    # Outcome worker
-
-    threading.Thread(
-
-        target=outcome_worker_thread,
-
-        name="OutcomeWorker",
-
-        daemon=True,
-
-    ).start()
-
-    # Telegram
-
-    threading.Thread(
-
-        target=run_bot,
-
-        name="TelegramBot",
-
-        daemon=True,
-
-    ).start()
-
-    port = int(
-
-        os.getenv(
-
-            "PORT",
-
-            "10000",
-
-        )
+        "SET" if BOT_TOKEN else "MISSING"
 
     )
 
     print(
 
-        f"Flask starting on port {port}"
+        "CHAT_ID:",
+
+        "SET" if CHAT_ID else "MISSING"
+
+    )
+
+    print(
+
+        "QUOTEX_EMAIL:",
+
+        "SET" if QUOTEX_EMAIL else "MISSING"
+
+    )
+
+    print(
+
+        "QUOTEX_PASSWORD:",
+
+        "SET" if QUOTEX_PASSWORD else "MISSING"
+
+    )
+
+    print(
+
+        "DATABASE_URL:",
+
+        "SET" if DATABASE_URL else "NOT SET (SQLite)"
+
+    )
+
+    print(
+
+        "=========================================="
+
+    )
+
+def main():
+
+    print_config_status()
+
+    db_init()
+
+    # Telegram
+
+    t1 = threading.Thread(
+
+        target=telegram_thread,
+
+        name="TelegramThread",
+
+        daemon=True
+
+    )
+
+    t1.start()
+
+    # Quotex
+
+    t2 = threading.Thread(
+
+        target=quotex_thread,
+
+        name="QuotexThread",
+
+        daemon=True
+
+    )
+
+    t2.start()
+
+    print(
+
+        "Scanner thread started"
+
+    )
+
+    print(
+
+        "Outcome worker included"
+
+    )
+
+    print(
+
+        f"Flask starting on port {PORT}"
 
     )
 
@@ -2930,8 +2596,36 @@ if __name__ == "__main__":
 
         host="0.0.0.0",
 
-        port=port,
+        port=PORT,
 
-        threaded=True,
+        debug=False,
+
+        use_reloader=False,
 
     )
+
+if __name__ == "__main__":
+
+    try:
+
+        main()
+
+    except KeyboardInterrupt:
+
+        print(
+
+            "Bot stopped."
+
+        )
+
+    except Exception as e:
+
+        print(
+
+            "MAIN ERROR:",
+
+            repr(e)
+
+        )
+
+        traceback.print_exc()
