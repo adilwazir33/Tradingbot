@@ -26,11 +26,9 @@ DB_PATH = os.getenv("DB_PATH", "/tmp/quotex_v10.db")
 
 app = Flask(__name__)
 @app.route("/")
-def home():
-    return "QUOTEX v10.6 ASYNC LIVE FIXED"
+def home(): return "QUOTEX v10.6 ASYNC LIVE FIXED"
 @app.route("/health")
-def health():
-    return "OK"
+def health(): return "OK"
 
 sent_cache = OrderedDict()
 outcome_queue = queue.Queue()
@@ -43,15 +41,13 @@ def normalize_qx_ts(ts):
     if ts > 1_000_000_000_000: ts //= 1000
     return ts
 
-def get_draw_threshold(asset, price):
-    return 0.005 if "JPY" in asset.upper() else 0.00002
+def get_draw_threshold(asset, price): return 0.005 if "JPY" in asset.upper() else 0.00002
 
 def get_next_candle_times(last_entry=None):
     now = time.time()
     current_minute = int(now // 60) * 60
     entry_ts = current_minute - 60
-    if last_entry is not None and entry_ts <= last_entry:
-        entry_ts += 60
+    if last_entry is not None and entry_ts <= last_entry: entry_ts += 60
     expiry_ts = entry_ts + 60
     expiry_close_ts = expiry_ts + 60
     scan_ts = entry_ts + 62
@@ -83,68 +79,50 @@ def get_db_conn():
     db_url = os.getenv("DATABASE_URL")
     if db_url:
         import psycopg2
-        conn = psycopg2.connect(db_url)
-        conn.autocommit = True
+        conn = psycopg2.connect(db_url); conn.autocommit = True
         return conn, "postgres"
     conn = sqlite3.connect(DB_PATH, timeout=30)
     return conn, "sqlite"
 
 def init_db():
-    conn, db_type = get_db_conn()
-    cur = conn.cursor()
-    if db_type == "postgres":
-        cur.execute("""CREATE TABLE IF NOT EXISTS signals (id TEXT PRIMARY KEY, timestamp TEXT, asset TEXT, base_asset TEXT, is_otc INTEGER, signal TEXT, entry_price DOUBLE PRECISION, entry_candle_time BIGINT, expiry_candle_time BIGINT, expiry_close DOUBLE PRECISION, outcome TEXT, rsi DOUBLE PRECISION, confidence TEXT)""")
-    else:
-        cur.execute("""CREATE TABLE IF NOT EXISTS signals (id TEXT PRIMARY KEY, timestamp TEXT, asset TEXT, base_asset TEXT, is_otc INTEGER, signal TEXT, entry_price REAL, entry_candle_time INTEGER, expiry_candle_time INTEGER, expiry_close REAL, outcome TEXT, rsi REAL, confidence TEXT)""")
-        conn.commit()
+    conn, db_type = get_db_conn(); cur = conn.cursor()
+    if db_type == "postgres": cur.execute("""CREATE TABLE IF NOT EXISTS signals (id TEXT PRIMARY KEY, timestamp TEXT, asset TEXT, base_asset TEXT, is_otc INTEGER, signal TEXT, entry_price DOUBLE PRECISION, entry_candle_time BIGINT, expiry_candle_time BIGINT, expiry_close DOUBLE PRECISION, outcome TEXT, rsi DOUBLE PRECISION, confidence TEXT)""")
+    else: cur.execute("""CREATE TABLE IF NOT EXISTS signals (id TEXT PRIMARY KEY, timestamp TEXT, asset TEXT, base_asset TEXT, is_otc INTEGER, signal TEXT, entry_price REAL, entry_candle_time INTEGER, expiry_candle_time INTEGER, expiry_close REAL, outcome TEXT, rsi REAL, confidence TEXT)"""); conn.commit()
     conn.close()
 
 def db_insert(data):
-    conn, db_type = get_db_conn()
-    cur = conn.cursor()
-    if db_type == "postgres":
-        cur.execute("""INSERT INTO signals (id, timestamp, asset, base_asset, is_otc, signal, entry_price, entry_candle_time, expiry_candle_time, expiry_close, outcome, rsi, confidence) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (id) DO NOTHING""", (data["id"], data["timestamp"], data["asset"], data["base_asset"], data["is_otc"], data["signal"], data["entry_price"], data["entry_candle_time"], data["expiry_candle_time"], data["expiry_close"], data["outcome"], data["rsi"], data["confidence"]))
-    else:
-        cur.execute("""INSERT OR IGNORE INTO signals VALUES (:id,:timestamp,:asset,:base_asset,:is_otc,:signal,:entry_price,:entry_candle_time,:expiry_candle_time,:expiry_close,:outcome,:rsi,:confidence)""", data)
-        conn.commit()
+    conn, db_type = get_db_conn(); cur = conn.cursor()
+    if db_type == "postgres": cur.execute("""INSERT INTO signals (id, timestamp, asset, base_asset, is_otc, signal, entry_price, entry_candle_time, expiry_candle_time, expiry_close, outcome, rsi, confidence) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (id) DO NOTHING""", (data["id"], data["timestamp"], data["asset"], data["base_asset"], data["is_otc"], data["signal"], data["entry_price"], data["entry_candle_time"], data["expiry_candle_time"], data["expiry_close"], data["outcome"], data["rsi"], data["confidence"]))
+    else: cur.execute("""INSERT OR IGNORE INTO signals VALUES (:id,:timestamp,:asset,:base_asset,:is_otc,:signal,:entry_price,:entry_candle_time,:expiry_candle_time,:expiry_close,:outcome,:rsi,:confidence)""", data); conn.commit()
     conn.close()
 
 def db_update(signal_id, expiry_close, outcome):
-    conn, db_type = get_db_conn()
-    cur = conn.cursor()
+    conn, db_type = get_db_conn(); cur = conn.cursor()
     if db_type == "postgres": cur.execute("""UPDATE signals SET expiry_close=%s, outcome=%s WHERE id=%s""", (expiry_close, outcome, signal_id))
     else: cur.execute("""UPDATE signals SET expiry_close=?, outcome=? WHERE id=?""", (expiry_close, outcome, signal_id)); conn.commit()
     conn.close()
 
 def db_stats():
-    conn, db_type = get_db_conn()
-    cur = conn.cursor()
+    conn, db_type = get_db_conn(); cur = conn.cursor()
     def winrate(extra=""):
         cur.execute(f"""SELECT COUNT(*), SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END) FROM signals WHERE outcome IN ('WIN','LOSS') {extra}""")
-        total, wins = cur.fetchone()
-        total = total or 0; wins = wins or 0
+        total, wins = cur.fetchone(); total = total or 0; wins = wins or 0
         return total, wins, wins / total * 100 if total else 0
-    stats = {}
-    stats["ALL"] = winrate()
+    stats = {}; stats["ALL"] = winrate()
     for pair in BASE_PAIRS: stats[pair] = winrate(f"AND base_asset='{pair}'")
-    stats["OTC"] = winrate("AND is_otc=1"); stats["NORMAL"] = winrate("AND is_otc=0")
-    stats["CALL"] = winrate("AND signal='CALL'"); stats["PUT"] = winrate("AND signal='PUT'")
-    stats["HIGH"] = winrate("AND confidence='HIGH'"); stats["MEDIUM"] = winrate("AND confidence='MEDIUM'")
-    conn.close()
-    return stats
+    stats["OTC"] = winrate("AND is_otc=1"); stats["NORMAL"] = winrate("AND is_otc=0"); stats["CALL"] = winrate("AND signal='CALL'"); stats["PUT"] = winrate("AND signal='PUT'"); stats["HIGH"] = winrate("AND confidence='HIGH'"); stats["MEDIUM"] = winrate("AND confidence='MEDIUM'")
+    conn.close(); return stats
 
 init_db()
 
 async def login_qx_safe():
-    if not QUOTEX_EMAIL or not QUOTEX_PASS:
-        print("ERROR: QUOTEX_EMAIL / QUOTEX_PASS missing"); return None
+    if not QUOTEX_EMAIL or not QUOTEX_PASS: print("ERROR: QUOTEX_EMAIL / QUOTEX_PASS missing"); return None
     for attempt in range(1, 4):
         qx = None
         try:
             qx = Quotex(email=QUOTEX_EMAIL, password=QUOTEX_PASS, lang="en", host="qxbroker.com", period_default=PERIOD)
             ok, reason = await qx.connect()
-            if ok:
-                print(f"Quotex connected: {reason}"); return qx
+            if ok: print(f"Quotex connected: {reason}"); return qx
             print(f"Quotex login failed {attempt}/3: {reason}")
         except Exception as e: print(f"Quotex login exception {attempt}/3: {e}")
         if qx:
@@ -170,8 +148,7 @@ def ema(series, period): return series.ewm(span=period, adjust=False).mean()
 def rsi_calc(series, period=14):
     delta = series.diff(); gain = delta.clip(lower=0); loss = -delta.clip(upper=0)
     avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean(); avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, float("nan"))
-    return 100 - (100 / (1 + rs))
+    rs = avg_gain / avg_loss.replace(0, float("nan")); return 100 - (100 / (1 + rs))
 
 async def get_candles_safe(qx, asset, count=100):
     try: return await qx.get_candles(asset, time.time(), PERIOD * count, PERIOD, timeout=15, use_cache=False)
@@ -220,8 +197,7 @@ async def fetch_expiry_candle(qx, asset, target_ts, retries=5):
     return None
 
 async def outcome_worker_loop():
-    print("Outcome worker v10.6 started")
-    qx = await login_qx_safe()
+    print("Outcome worker v10.6 started"); qx = await login_qx_safe()
     while True:
         job = None
         try:
@@ -239,8 +215,7 @@ async def outcome_worker_loop():
                     try: await qx.close()
                     except: pass
                     qx = await login_qx_safe()
-            if not qx:
-                db_update(signal_id, None, "LOGIN_FAIL"); continue
+            if not qx: db_update(signal_id, None, "LOGIN_FAIL"); continue
             candle = await fetch_expiry_candle(qx, asset, expiry_ts, retries=5)
             expiry_close = None; outcome = "UNKNOWN"
             if candle:
@@ -267,14 +242,12 @@ def outcome_worker_thread(): asyncio.run(outcome_worker_loop())
 
 async def scanner_loop():
     global last_scanned_entry_ts
-    print("Scanner v10.6 started")
-    qx = await login_qx_safe()
+    print("Scanner v10.6 started"); qx = await login_qx_safe()
     while True:
         try:
             if not qx:
                 qx = await login_qx_safe()
-                if not qx:
-                    await asyncio.sleep(30); continue
+                if not qx: await asyncio.sleep(30); continue
             try: connected = await qx.check_connect()
             except: connected = False
             if not connected:
@@ -282,8 +255,7 @@ async def scanner_loop():
                 try: await qx.close()
                 except: pass
                 qx = await login_qx_safe()
-                if not qx:
-                    await asyncio.sleep(30); continue
+                if not qx: await asyncio.sleep(30); continue
             entry_dt, expiry_dt, expiry_close_dt, sleep_sec, entry_ts, expiry_ts, expiry_close_ts = get_next_candle_times(last_scanned_entry_ts)
             print(f"Sleep {sleep_sec:.1f}s -> Entry {entry_dt.strftime('%H:%M:%S')} Exp {expiry_close_dt.strftime('%H:%M:%S')} UTC")
             if sleep_sec > 0: await asyncio.sleep(sleep_sec)
@@ -313,16 +285,13 @@ async def scanner_loop():
 
 def scanner_thread(): asyncio.run(scanner_loop())
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🟢 QUOTEX v10.6 ONLINE\n\n/stats\n/market\n/status")
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🟢 v10.6 ONLINE\nOutcome Queue: {outcome_queue.qsize()}")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE): await update.message.reply_text("🟢 QUOTEX v10.6 ONLINE\n\n/stats\n/market\n/status")
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE): await update.message.reply_text(f"🟢 v10.6 ONLINE\nOutcome Queue: {outcome_queue.qsize()}")
 async def market(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Checking market...")
     entry_dt, expiry_dt, expiry_close_dt, _, entry_ts, expiry_ts, expiry_close_ts = get_next_candle_times(None)
     qx = await login_qx_safe()
-    if not qx:
-        await update.message.reply_text("❌ Quotex login failed"); return
+    if not qx: await update.message.reply_text("❌ Quotex login failed"); return
     try:
         lines = [f"📊 v10.6 MARKET", f"Candle: {entry_dt.strftime('%H:%M:%S')} UTC"]
         for base in BASE_PAIRS:
@@ -331,9 +300,7 @@ async def market(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not asset: lines.append(f"⚪ {base}: CLOSED"); continue
                 note = " (OTC)" if is_otc else ""
                 result = await analyze_pair(qx, asset, entry_ts)
-                if result:
-                    emoji = "🟢" if result["signal"] == "CALL" else "🔴"
-                    lines.append(f"{emoji} {asset}{note}: {result['signal']} [{result['conf']}]")
+                if result: emoji = "🟢" if result["signal"] == "CALL" else "🔴"; lines.append(f"{emoji} {asset}{note}: {result['signal']} [{result['conf']}]")
                 else: lines.append(f"⚪ {asset}{note}: WAIT")
             except Exception as e: lines.append(f"⚠️ {base}: ERROR"); print(f"/market {base}:", e)
         await update.message.reply_text("\n".join(lines))
@@ -352,6 +319,8 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def run_bot():
     if not BOT_TOKEN: print("BOT_TOKEN missing"); return
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
