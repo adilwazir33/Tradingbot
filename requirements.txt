@@ -3,3 +3,4 @@ requests==2.34.2
 pandas==3.0.6
 numpy==2.5.3
 python-telegram-bot==22.5
+python-3.12.10
